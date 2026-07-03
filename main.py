@@ -837,6 +837,9 @@ live_mix = None
 _charts_auto_timer_started = False
 chart_refresh_interval = 10  # seconds for charts auto-refresh (user configurable, >=2)
 last_chart_refresh_time = 0.0  # monotonic time of last auto chart refresh
+charts_auto_refresh_enabled = True
+# plots refs for in-place updates to avoid full re-creation flicker
+plots = {"power": None, "soc": None, "cost": None}
 
 
 def build_sidebar():
@@ -1032,65 +1035,84 @@ async def show_charts():
             current_range = {"hours": 24}
             chart_container = None
             auto_status = None
+            pause_btn = None
+            # reset per-visit plot refs
+            plots["power"] = plots["soc"] = plots["cost"] = None
 
             # Define load first (closures will resolve names at runtime)
             async def load_and_render(hours: int, from_auto: bool = False):
                 try:
                     since = datetime.now(timezone.utc) - timedelta(hours=hours)
                     rows = await get_readings_since(since)
-                    chart_container.clear()
-                    with chart_container:
-                        fig1 = create_power_chart(rows, f"Power (last {hours}h)")
-                        p1 = ui.plotly(fig1).classes("w-full")
-                        fig2 = create_soc_chart(rows)
-                        p2 = ui.plotly(fig2).classes("w-full")
 
-                        # Price-based cost chart (simple cumulative using current config prices)
-                        try:
-                            buy, sell = get_current_prices_pln()
-                            cum = 0.0
-                            cts, cvals = [], []
-                            pt = None
-                            for r in rows:
-                                t = datetime.fromisoformat(r["timestamp"]).astimezone()
-                                gp = r.get("grid_power") or 0
-                                if pt and gp > 0.01:
-                                    dt = (t - pt).total_seconds() / 3600.0
-                                    cum += gp * dt * buy
-                                cts.append(t)
-                                cvals.append(round(cum, 2))
-                                pt = t
-                            if cvals:
-                                # force non-negative, use grosze for y values for nicer numbers
-                                grosze_vals = [max(0, int(round(v * 100))) for v in cvals]
-                                cfig = go.Figure()
-                                hover_text = [f"{v:.2f} PLN ({g} gr)" for v, g in zip(cvals, grosze_vals)]
-                                cfig.add_trace(go.Scatter(
-                                    x=cts, y=grosze_vals,
-                                    name="Cumulative cost (grosze)",
-                                    line=dict(color="#f66", width=2.5),
-                                    hovertemplate="%{text}<extra></extra>",
-                                    text=hover_text
-                                ))
-                                max_g = max(grosze_vals) if grosze_vals else 1
-                                cfig.update_layout(
-                                    title=f"Est. Cumulative Grid Cost (buy {buy*100:.0f} gr/kWh)",
-                                    height=200,
-                                    paper_bgcolor="#1e1e1e",
-                                    plot_bgcolor="#1e1e1e",
-                                    font=dict(color="#ddd", size=10),
-                                    margin=dict(t=25, b=5, l=40, r=10),
-                                    yaxis=dict(title="grosze", gridcolor="#333", range=[0, max(1, max_g * 1.2)]),
-                                    xaxis=dict(gridcolor="#333"),
-                                    hoverlabel=dict(
-                                        bgcolor="#1f2937",
-                                        bordercolor="#374151",
-                                        font=dict(color="#e5e7eb", size=11)
-                                    )
+                    # Always build fresh figures
+                    fig1 = create_power_chart(rows, f"Power (last {hours}h)")
+                    fig2 = create_soc_chart(rows)
+
+                    # Price-based cost chart
+                    cfig = None
+                    try:
+                        buy, sell = get_current_prices_pln()
+                        cum = 0.0
+                        cts, cvals = [], []
+                        pt = None
+                        for r in rows:
+                            t = datetime.fromisoformat(r["timestamp"]).astimezone()
+                            gp = r.get("grid_power") or 0
+                            if pt and gp > 0.01:
+                                dt = (t - pt).total_seconds() / 3600.0
+                                cum += gp * dt * buy
+                            cts.append(t)
+                            cvals.append(round(cum, 2))
+                            pt = t
+                        if cvals:
+                            grosze_vals = [max(0, int(round(v * 100))) for v in cvals]
+                            cfig = go.Figure()
+                            hover_text = [f"{v:.2f} PLN ({g} gr)" for v, g in zip(cvals, grosze_vals)]
+                            cfig.add_trace(go.Scatter(
+                                x=cts, y=grosze_vals,
+                                name="Cumulative cost (grosze)",
+                                line=dict(color="#f66", width=2.5),
+                                hovertemplate="%{text}<extra></extra>",
+                                text=hover_text
+                            ))
+                            max_g = max(grosze_vals) if grosze_vals else 1
+                            cfig.update_layout(
+                                title=f"Est. Cumulative Grid Cost (buy {buy*100:.0f} gr/kWh)",
+                                height=200,
+                                paper_bgcolor="#1e1e1e",
+                                plot_bgcolor="#1e1e1e",
+                                font=dict(color="#ddd", size=10),
+                                margin=dict(t=25, b=5, l=40, r=10),
+                                yaxis=dict(title="grosze", gridcolor="#333", range=[0, max(1, max_g * 1.2)]),
+                                xaxis=dict(gridcolor="#333"),
+                                hoverlabel=dict(
+                                    bgcolor="#1f2937",
+                                    bordercolor="#374151",
+                                    font=dict(color="#e5e7eb", size=11)
                                 )
-                                ui.plotly(cfig).classes("w-full")
-                        except Exception:
-                            pass
+                            )
+                    except Exception:
+                        pass
+
+                    # Create plots only once (first load), then update in place to avoid flicker
+                    if plots["power"] is None:
+                        chart_container.clear()
+                        with chart_container:
+                            plots["power"] = ui.plotly(fig1).classes("w-full")
+                            plots["soc"] = ui.plotly(fig2).classes("w-full")
+                            if cfig:
+                                plots["cost"] = ui.plotly(cfig).classes("w-full")
+                    else:
+                        plots["power"].update_figure(fig1)
+                        plots["soc"].update_figure(fig2)
+                        if cfig and plots.get("cost"):
+                            plots["cost"].update_figure(cfig)
+                        elif cfig and not plots.get("cost"):
+                            # rare case if cost appeared later
+                            with chart_container:
+                                plots["cost"] = ui.plotly(cfig).classes("w-full")
+
                     if not from_auto and auto_status:
                         auto_status.set_text(f"Auto-refreshing every {chart_refresh_interval}s — preset period active")
                 except Exception:
@@ -1105,7 +1127,10 @@ async def show_charts():
                             current_range["hours"] = h
                             await load_and_render(h)
                             if auto_status:
-                                auto_status.set_text(f"Auto-refreshing every {chart_refresh_interval}s — preset active")
+                                if charts_auto_refresh_enabled:
+                                    auto_status.set_text(f"Auto-refreshing every {chart_refresh_interval}s — preset active")
+                                else:
+                                    auto_status.set_text("Auto-refresh PAUSED — use Refresh or range buttons to update")
                         return hnd
                     ui.button(label, on_click=make_handler()).props("outline size=sm")
 
@@ -1131,8 +1156,27 @@ async def show_charts():
 
                 ui.button("Apply", on_click=apply_refresh_period).props("size=sm")
 
+                def toggle_auto_refresh():
+                    global charts_auto_refresh_enabled, last_chart_refresh_time
+                    charts_auto_refresh_enabled = not charts_auto_refresh_enabled
+                    if pause_btn:
+                        pause_btn.set_text("▶ Resume Auto-Refresh" if not charts_auto_refresh_enabled else "⏸ Pause Auto-Refresh")
+                    if auto_status:
+                        if charts_auto_refresh_enabled:
+                            last_chart_refresh_time = time.monotonic()  # avoid immediate refresh on resume
+                            auto_status.set_text(f"Auto-refreshing every {chart_refresh_interval}s — preset period active")
+                        else:
+                            auto_status.set_text("Auto-refresh PAUSED — use Refresh or range buttons to update")
+
+                pause_btn = ui.button("⏸ Pause Auto-Refresh", on_click=toggle_auto_refresh).props("size=sm outline")
+
                 async def do_refresh():
                     await load_and_render(current_range["hours"])
+                    if auto_status:
+                        if charts_auto_refresh_enabled:
+                            auto_status.set_text(f"Auto-refreshing every {chart_refresh_interval}s — preset active")
+                        else:
+                            auto_status.set_text("Auto-refresh PAUSED — use Refresh or range buttons to update")
                 ui.button("Refresh Charts", on_click=do_refresh, icon="refresh").props("size=sm")
 
             # Status immediately after controls (still top area)
@@ -1148,11 +1192,11 @@ async def show_charts():
                 async def charts_auto_tick():
                     global last_chart_refresh_time
                     now = time.monotonic()
-                    if now - last_chart_refresh_time >= chart_refresh_interval:
+                    if charts_auto_refresh_enabled and (now - last_chart_refresh_time >= chart_refresh_interval):
                         last_chart_refresh_time = now
                         try:
                             await load_and_render(current_range["hours"], from_auto=True)
-                            if auto_status:
+                            if auto_status and charts_auto_refresh_enabled:
                                 auto_status.set_text(f"Auto-refreshing every {chart_refresh_interval}s • updated {datetime.now().strftime('%H:%M:%S')}")
                         except Exception:
                             pass
