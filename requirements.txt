@@ -1,0 +1,11 @@
+# SigenStor Dashboard requirements
+# Python 3.10+
+
+nicegui>=2.0
+plotly>=5.20
+pymodbus>=3.7.0
+aiosqlite>=0.20.0
+python-dotenv>=1.0  # optional for future env config
+
+# For packaging if needed later
+# pyinstaller
