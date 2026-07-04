@@ -226,6 +226,11 @@ class SigenModbusClient:
         self.connected = False
 
     async def connect(self) -> bool:
+        # Always clean up any previous client before attempting a new connection.
+        # This prevents the underlying socket/transport from getting into a
+        # half-open or corrupted state after repeated failures (common cause
+        # of "stops returning data after a while, restart fixes it").
+        await self.close()
         try:
             self.client = AsyncModbusTcpClient(host=self.ip, port=self.port, timeout=5)
             self.connected = await self.client.connect()
@@ -326,6 +331,13 @@ class SigenModbusClient:
             # treat as partial fail; still return what we have or None
             # for demo we keep going with what we got
             pass
+
+        # Critical: if SOC (first/essential register) is missing, do not return a
+        # partial/degraded reading. This prevents the UI from entering and getting
+        # stuck in the "— / 0.00 kW → / Unknown" state (see diagnosis).
+        if data.get("soc") is None:
+            logger.debug("SOC read failed or missing; returning None to avoid poisoning latest_reading / UI")
+            return None
 
         # Compute load power: Load = PV + Grid - Battery
         pv = data.get("pv_power") or 0.0
@@ -602,6 +614,10 @@ async def start_poller():
                         pass  # safe if not on dashboard or no context
                 else:
                     logger.warning("Poll returned no data (connection issue?)")
+                    # Ensure we clean up the client on every failure path.
+                    # Prevents the Modbus client from entering a permanently bad state.
+                    if modbus_client:
+                        await modbus_client.close()
             except Exception as e:
                 logger.error(f"Poll loop error: {e}")
                 if modbus_client:
@@ -1056,7 +1072,8 @@ def update_live_dashboard():
         async def ensure_latest():
             global latest_reading
             row = await get_latest_reading()
-            if row:
+            if row and row.get("soc") is not None:
+                # Only accept rows that have valid SOC (prevents loading old poisoned partial rows)
                 latest_reading = Reading(
                     timestamp=row.get("timestamp") or datetime.now(timezone.utc).isoformat(),
                     soc=row.get("soc"),
