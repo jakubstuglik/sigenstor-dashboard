@@ -14,6 +14,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import time
+from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiosqlite
@@ -407,6 +408,19 @@ CREATE TABLE IF NOT EXISTS energy_daily (
     grid_export_kwh REAL DEFAULT 0,
     load_energy_kwh REAL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS aggregation_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_timestamp TEXT NOT NULL,
+    duration_seconds REAL,
+    rows_processed INTEGER DEFAULT 0,
+    buckets_created INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'success',
+    error_message TEXT,
+    cutoff_time TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_aggregation_runs_ts ON aggregation_runs(run_timestamp);
 """
 
 
@@ -493,6 +507,20 @@ async def get_recent_raw(limit: int = 200) -> List[Dict[str, Any]]:
         db.row_factory = aiosqlite.Row
         async with db.execute(
             "SELECT * FROM measurements ORDER BY timestamp DESC LIMIT ?",
+            (limit,),
+        ) as cur:
+            rows = await cur.fetchall()
+            return [dict(r) for r in rows]
+
+
+async def get_aggregation_runs(limit: int = 100) -> List[Dict[str, Any]]:
+    """Get recent aggregation run records for UI display."""
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            """SELECT * FROM aggregation_runs 
+               ORDER BY run_timestamp DESC 
+               LIMIT ?""",
             (limit,),
         ) as cur:
             rows = await cur.fetchall()
@@ -670,13 +698,14 @@ async def refresh_period_energy_chart():
 # =============================================================================
 
 poller_task: Optional[asyncio.Task] = None
+maintenance_task: Optional[asyncio.Task] = None
 latest_reading: Optional[Reading] = None
 modbus_client: Optional[SigenModbusClient] = None
 current_config: Dict[str, Any] = load_config()
 
 
 async def start_poller():
-    global poller_task, modbus_client, current_config
+    global poller_task, maintenance_task, modbus_client, current_config
     if poller_task and not poller_task.done():
         poller_task.cancel()
 
@@ -722,15 +751,21 @@ async def start_poller():
             await asyncio.sleep(interval)
 
     poller_task = asyncio.create_task(_poll_loop())
-    asyncio.create_task(maintenance_loop())
+    maintenance_task = asyncio.create_task(maintenance_loop())
 
 
 async def stop_poller():
-    global poller_task, modbus_client
+    global poller_task, maintenance_task, modbus_client
     if poller_task:
         poller_task.cancel()
         try:
             await poller_task
+        except asyncio.CancelledError:
+            pass
+    if maintenance_task:
+        maintenance_task.cancel()
+        try:
+            await maintenance_task
         except asyncio.CancelledError:
             pass
     if modbus_client:
@@ -738,68 +773,136 @@ async def stop_poller():
     logger.info("Poller stopped")
 
 
-async def aggregate_old_data():
-    """Aggregate measurements older than 1 day into 30s buckets to save space."""
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-    async with aiosqlite.connect(DB_FILE) as db:
-        cur = await db.execute(
-            """SELECT timestamp, soc, pv_power, battery_power, grid_power, load_power, grid_status,
-                      battery_max_charge_power, battery_max_discharge_power
-               FROM measurements WHERE timestamp < ? ORDER BY timestamp""",
-            (cutoff,)
-        )
-        rows = await cur.fetchall()
-        if not rows:
-            return 0
+async def aggregate_old_data() -> int:
+    """Aggregate measurements older than 1 day into 30s buckets to save space.
+    Always records the run into aggregation_runs table.
+    """
+    import time as _time  # local to avoid shadowing
+    start_ts = datetime.now(timezone.utc)
+    start_perf = _time.perf_counter()
+    cutoff = (start_ts - timedelta(days=1)).isoformat()
+    rows_processed = 0
+    buckets_created = 0
+    status = 'success'
+    error_message = None
 
-        from collections import defaultdict
-        buckets = defaultdict(list)
-        for row in rows:
-            ts = row[0]
-            try:
-                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            except Exception:
-                continue
-            # floor to 30s
-            secs = (dt.second // 30) * 30
-            bucket_dt = dt.replace(second=secs, microsecond=0)
-            key = bucket_dt.isoformat()
-            buckets[key].append(row[1:])
-
-        inserts = []
-        for key, group in buckets.items():
-            if not group:
-                continue
-            n = len(group)
-            def avg(idx):
-                vals = [g[idx] for g in group if g[idx] is not None]
-                return sum(vals) / len(vals) if vals else None
-            soc = avg(0)
-            pv = avg(1)
-            bat = avg(2)
-            grid = avg(3)
-            load = avg(4)
-            # status: last non-null
-            status = None
-            for g in reversed(group):
-                if g[5] is not None:
-                    status = g[5]
-                    break
-            max_ch = avg(6)
-            max_dis = avg(7)
-            inserts.append((key, soc, pv, bat, grid, load, status, max_ch, max_dis))
-
-        if inserts:
-            await db.execute("DELETE FROM measurements WHERE timestamp < ?", (cutoff,))
-            await db.executemany(
-                """INSERT INTO measurements (timestamp, soc, pv_power, battery_power, grid_power, load_power,
-                                              grid_status, battery_max_charge_power, battery_max_discharge_power)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
-                inserts
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            cur = await db.execute(
+                """SELECT timestamp, soc, pv_power, battery_power, grid_power, load_power, grid_status,
+                          battery_max_charge_power, battery_max_discharge_power
+                   FROM measurements WHERE timestamp < ? ORDER BY timestamp""",
+                (cutoff,)
             )
-            await db.commit()
-            logger.info(f"Aggregated {len(rows)} rows >1d old into {len(inserts)} 30s buckets")
-        return len(rows)
+            rows = await cur.fetchall()
+            rows_processed = len(rows) if rows else 0
+
+            if not rows:
+                # no rows, but will still record the run below
+                pass
+            else:
+                from collections import defaultdict
+                buckets = defaultdict(list)
+                for row in rows:
+                    ts = row[0]
+                    try:
+                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    except Exception:
+                        continue
+                    # floor to 30s
+                    secs = (dt.second // 30) * 30
+                    bucket_dt = dt.replace(second=secs, microsecond=0)
+                    key = bucket_dt.isoformat()
+                    buckets[key].append(row[1:])
+
+                inserts = []
+                for key, group in buckets.items():
+                    if not group:
+                        continue
+                    n = len(group)
+                    def avg(idx):
+                        vals = [g[idx] for g in group if g[idx] is not None]
+                        return sum(vals) / len(vals) if vals else None
+                    soc = avg(0)
+                    pv = avg(1)
+                    bat = avg(2)
+                    grid = avg(3)
+                    load = avg(4)
+                    # status: last non-null
+                    status_val = None
+                    for g in reversed(group):
+                        if g[5] is not None:
+                            status_val = g[5]
+                            break
+                    max_ch = avg(6)
+                    max_dis = avg(7)
+                    inserts.append((key, soc, pv, bat, grid, load, status_val, max_ch, max_dis))
+
+                if inserts:
+                    await db.execute("DELETE FROM measurements WHERE timestamp < ?", (cutoff,))
+                    await db.executemany(
+                        """INSERT INTO measurements (timestamp, soc, pv_power, battery_power, grid_power, load_power,
+                                                      grid_status, battery_max_charge_power, battery_max_discharge_power)
+                           VALUES (?,?,?,?,?,?,?,?,?)""",
+                        inserts
+                    )
+                    await db.commit()
+                    buckets_created = len(inserts)
+                    logger.info(f"Aggregated {rows_processed} rows >1d old into {buckets_created} 30s buckets")
+
+    except Exception as e:
+        status = 'error'
+        error_message = str(e)
+        logger.error(f"Aggregation run error: {e}")
+
+    # Always record the run
+    duration = _time.perf_counter() - start_perf
+    try:
+        await _log_aggregation_run(
+            run_timestamp=start_ts.isoformat(),
+            duration_seconds=round(duration, 3),
+            rows_processed=rows_processed,
+            buckets_created=buckets_created,
+            status=status,
+            error_message=error_message,
+            cutoff_time=cutoff
+        )
+    except Exception as log_err:
+        logger.error(f"Failed to log aggregation run: {log_err}")
+
+    return rows_processed
+
+
+async def _log_aggregation_run(
+    run_timestamp: str,
+    duration_seconds: float,
+    rows_processed: int,
+    buckets_created: int,
+    status: str,
+    error_message: Optional[str],
+    cutoff_time: str
+):
+    async with aiosqlite.connect(DB_FILE) as db:
+        # Ensure table exists (for running instances before restart)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS aggregation_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                run_timestamp TEXT NOT NULL,
+                duration_seconds REAL,
+                rows_processed INTEGER DEFAULT 0,
+                buckets_created INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'success',
+                error_message TEXT,
+                cutoff_time TEXT
+            )
+        """)
+        await db.execute(
+            """INSERT INTO aggregation_runs 
+               (run_timestamp, duration_seconds, rows_processed, buckets_created, status, error_message, cutoff_time)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (run_timestamp, duration_seconds, rows_processed, buckets_created, status, error_message, cutoff_time)
+        )
+        await db.commit()
 
 
 async def maintenance_loop():
@@ -809,6 +912,30 @@ async def maintenance_loop():
         except Exception as e:
             logger.error(f"Maintenance aggregation error: {e}")
         await asyncio.sleep(3600)  # run hourly
+
+
+async def monitor_maintenance_task():
+    """Monitor the maintenance task and restart it if it stops/crashes."""
+    global maintenance_task
+    while True:
+        await asyncio.sleep(300)  # check every 5 minutes
+        if maintenance_task is None:
+            continue
+        if maintenance_task.done():
+            try:
+                exc = maintenance_task.exception()
+                if exc:
+                    logger.error(f"Maintenance task crashed: {exc}")
+            except asyncio.CancelledError:
+                logger.info("Maintenance task was cancelled")
+            except Exception as e:
+                logger.error(f"Error inspecting maintenance task: {e}")
+            logger.warning("Maintenance task stopped unexpectedly. Restarting...")
+            try:
+                maintenance_task = asyncio.create_task(maintenance_loop())
+                logger.info("Maintenance task restarted")
+            except Exception as restart_err:
+                logger.error(f"Failed to restart maintenance task: {restart_err}")
 
 
 # =============================================================================
@@ -857,7 +984,9 @@ def format_kw(val: Optional[float]) -> str:
 
 
 def create_sankey_figure(pv: float, battery: float, grid: float, load: float) -> go.Figure:
-    """Create energy flow Sankey diagram from current values (kW)."""
+    """Create energy flow visualization from (smoothed) power values (kW).
+    Values passed in are typically the mean of the last 3 readings to reduce noise.
+    """
     # Normalize flows (positive only)
     pv_p = max(0, pv or 0)
     bat_d = max(0, -(battery or 0))   # discharge
@@ -921,7 +1050,7 @@ def create_sankey_figure(pv: float, battery: float, grid: float, load: float) ->
         )
 
     fig.update_layout(
-        title="Power Flow (current kW) — arrows indicate typical direction",
+        title="Energy Flow (mean of last 3 readings, kW) — arrows indicate typical direction",
         barmode="overlay",
         xaxis=dict(title="|kW|", range=[-0.28 * max_abs, max_abs * 1.35], showgrid=True, gridcolor="#333", zeroline=True, zerolinecolor="#444"),
         yaxis=dict(showticklabels=False, autorange="reversed"),
@@ -1121,6 +1250,7 @@ main_content = None
 live_gauge = None
 live_mix = None
 period_energy_chart = None
+recent_flow_values = deque(maxlen=3)  # last 3 (pv, battery, grid, load) for smoothing Energy Flow
 _charts_auto_timer_started = False
 chart_refresh_interval = 10  # seconds for charts auto-refresh (user configurable, >=2)
 last_chart_refresh_time = 0.0  # monotonic time of last auto chart refresh
@@ -1140,6 +1270,7 @@ def build_sidebar():
             ("Charts", "charts", "show_chart"),
             ("Summary", "summary", "summarize"),
             ("Raw Data", "raw", "table_chart"),
+            ("Maintenance", "maintenance", "build"),
             ("Settings", "settings", "settings"),
         ]
 
@@ -1152,6 +1283,8 @@ def build_sidebar():
                 await show_summary()
             elif name == "raw":
                 await show_raw_data()
+            elif name == "maintenance":
+                await show_maintenance()
             elif name == "settings":
                 show_settings()
 
@@ -1163,7 +1296,7 @@ def build_sidebar():
 
 def update_live_dashboard():
     """Called by timer to refresh live values."""
-    global latest_reading, last_period_refresh
+    global latest_reading, last_period_refresh, recent_flow_values
 
     try:
         async def ensure_latest():
@@ -1203,6 +1336,16 @@ def update_live_dashboard():
             return
 
         r = latest_reading
+
+        # Collect recent power values for smoothing the Energy Flow visualization (mean of last 3)
+        try:
+            pv = float(r.pv_power or 0.0)
+            bat = float(r.battery_power or 0.0)
+            grd = float(r.grid_power or 0.0)
+            lod = float(r.load_power or 0.0)
+            recent_flow_values.append((pv, bat, grd, lod))
+        except Exception:
+            pass
     except Exception:
         # Prevent timer slot errors from crashing the callback
         return
@@ -1233,10 +1376,21 @@ def update_live_dashboard():
     except Exception:
         pass  # UI elements may have been cleared on navigation
 
-    # Update Sankey / flow
+    # Update Sankey / flow  (uses mean of last 3 readings to reduce jitter)
     try:
         if live_sankey is not None:
-            fig = create_sankey_figure(r.pv_power, r.battery_power, r.grid_power, r.load_power)
+            if recent_flow_values:
+                n = len(recent_flow_values)
+                avg_pv = sum(v[0] for v in recent_flow_values) / n
+                avg_bat = sum(v[1] for v in recent_flow_values) / n
+                avg_grd = sum(v[2] for v in recent_flow_values) / n
+                avg_lod = sum(v[3] for v in recent_flow_values) / n
+            else:
+                avg_pv = r.pv_power or 0
+                avg_bat = r.battery_power or 0
+                avg_grd = r.grid_power or 0
+                avg_lod = r.load_power or 0
+            fig = create_sankey_figure(avg_pv, avg_bat, avg_grd, avg_lod)
             live_sankey.update_figure(fig)
     except Exception:
         pass
@@ -1302,7 +1456,7 @@ def show_dashboard():
                 make_card("System Status", "power", "status", "gray-400")
 
             # Energy Flow (bars)
-            ui.label("Energy Flow").classes("text-xl mt-4 mb-1 font-semibold section-title")
+            ui.label("Energy Flow (mean of last 3 readings)").classes("text-xl mt-4 mb-1 font-semibold section-title")
             initial_fig = create_sankey_figure(0, 0, 0, 0)
             live_sankey = ui.plotly(initial_fig).classes("w-full")
 
@@ -1665,6 +1819,159 @@ async def show_raw_data():
             await load_table()
 
 
+async def show_maintenance():
+    """UI section for aggregation task history, status, and monitoring."""
+    global main_content
+    if main_content is None:
+        main_content = ui.column().classes("w-full")
+    main_content.clear()
+    with main_content:
+        with ui.column().classes("w-full p-4 gap-6"):
+            ui.label("Maintenance & Aggregation History").classes("text-3xl font-bold")
+
+            # Status header
+            status_container = ui.row().classes("gap-4 items-center flex-wrap")
+            runs_container = ui.column().classes("w-full")
+            chart_container = ui.column().classes("w-full")
+
+            async def load_maintenance_data():
+                runs = await get_aggregation_runs(100)
+                # Status
+                status_container.clear()
+                with status_container:
+                    if runs:
+                        last = runs[0]
+                        last_time = last.get("run_timestamp", "")
+                        try:
+                            last_dt = datetime.fromisoformat(last_time.replace("Z", "+00:00")).astimezone()
+                            last_str = last_dt.strftime("%Y-%m-%d %H:%M:%S")
+                        except Exception:
+                            last_str = last_time
+                        duration = last.get("duration_seconds", 0) or 0
+                        processed = last.get("rows_processed", 0) or 0
+                        buckets = last.get("buckets_created", 0) or 0
+                        stat = last.get("status", "success")
+
+                        ui.badge(f"Last run: {last_str}", color="primary")
+                        ui.badge(f"Duration: {duration:.2f}s", color="secondary")
+                        ui.badge(f"Rows: {processed}", color="info")
+                        ui.badge(f"Buckets: {buckets}", color="info")
+                        color = "positive" if stat == "success" else "negative"
+                        ui.badge(f"Status: {stat}", color=color)
+
+                        # Simple health check: last run < 2 hours ago?
+                        try:
+                            last_dt2 = datetime.fromisoformat(last_time.replace("Z", "+00:00")).astimezone()
+                            age_h = (datetime.now(timezone.utc) - last_dt2).total_seconds() / 3600
+                            health = "Healthy" if age_h < 2 else "Stale"
+                            hcolor = "positive" if age_h < 2 else "warning"
+                            ui.badge(f"Health: {health} (age {age_h:.1f}h)", color=hcolor)
+                        except Exception:
+                            pass
+                    else:
+                        ui.badge("No runs recorded yet", color="warning")
+
+                # Table
+                runs_container.clear()
+                with runs_container:
+                    ui.label("Recent Aggregation Runs").classes("text-xl font-semibold mt-4")
+                    if not runs:
+                        ui.label("No aggregation runs logged yet.").classes("text-gray-400")
+                        return
+
+                    columns = [
+                        {"name": "run_timestamp", "label": "Run Time", "field": "run_timestamp", "sortable": True},
+                        {"name": "duration_seconds", "label": "Duration (s)", "field": "duration_seconds"},
+                        {"name": "rows_processed", "label": "Rows Processed", "field": "rows_processed"},
+                        {"name": "buckets_created", "label": "30s Buckets", "field": "buckets_created"},
+                        {"name": "status", "label": "Status", "field": "status"},
+                        {"name": "error_message", "label": "Error", "field": "error_message"},
+                    ]
+
+                    formatted = []
+                    for r in runs:
+                        fr = {
+                            "run_timestamp": r.get("run_timestamp"),
+                            "duration_seconds": r.get("duration_seconds"),
+                            "rows_processed": r.get("rows_processed"),
+                            "buckets_created": r.get("buckets_created"),
+                            "status": r.get("status"),
+                            "error_message": r.get("error_message") or "",
+                        }
+                        if fr.get("run_timestamp"):
+                            try:
+                                dt = datetime.fromisoformat(fr["run_timestamp"].replace("Z", "+00:00")).astimezone()
+                                fr["run_timestamp"] = dt.strftime("%Y-%m-%d %H:%M:%S")
+                            except Exception:
+                                pass
+                        formatted.append(fr)
+
+                    ui.table(columns=columns, rows=formatted, row_key="run_timestamp", pagination=20).classes("w-full")
+
+                # Chart
+                chart_container.clear()
+                with chart_container:
+                    ui.label("Aggregation Activity Over Time").classes("text-xl font-semibold mt-4")
+                    if len(runs) < 2:
+                        ui.label("Need more runs for a chart.").classes("text-gray-400")
+                        return
+
+                    # reverse for chronological
+                    runs_sorted = sorted(runs, key=lambda x: x.get("run_timestamp", ""))
+                    try:
+                        times = []
+                        rows_p = []
+                        buckets_c = []
+                        for r in runs_sorted:
+                            ts = r.get("run_timestamp")
+                            if ts:
+                                dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+                                times.append(dt)
+                            else:
+                                times.append(None)
+                            rows_p.append(r.get("rows_processed") or 0)
+                            buckets_c.append(r.get("buckets_created") or 0)
+
+                        fig = go.Figure()
+                        fig.add_trace(go.Scatter(
+                            x=times, y=rows_p, name="Rows Processed",
+                            mode="lines+markers", line=dict(color="#2196f3")
+                        ))
+                        fig.add_trace(go.Scatter(
+                            x=times, y=buckets_c, name="Buckets Created",
+                            mode="lines+markers", line=dict(color="#4caf50")
+                        ))
+                        fig.update_layout(
+                            title="Aggregation Runs (rows & buckets)",
+                            xaxis_title="Time",
+                            yaxis_title="Count",
+                            height=280,
+                            paper_bgcolor="#1e1e1e",
+                            plot_bgcolor="#1e1e1e",
+                            font=dict(color="#ddd", size=11),
+                            margin=dict(t=30, b=10, l=50, r=10),
+                            legend=dict(orientation="h", y=-0.2)
+                        )
+                        ui.plotly(fig).classes("w-full")
+                    except Exception as chart_err:
+                        ui.label(f"Chart error: {chart_err}").classes("text-red-400")
+
+            # Controls
+            with ui.row().classes("gap-2 mt-2"):
+                ui.button("Refresh", on_click=lambda: asyncio.create_task(load_maintenance_data()), icon="refresh").props("size=sm")
+                async def force_run():
+                    ui.notify("Forcing aggregation run...", type="info")
+                    try:
+                        n = await aggregate_old_data()
+                        ui.notify(f"Aggregation completed. Processed {n} rows.", type="positive")
+                        await load_maintenance_data()
+                    except Exception as e:
+                        ui.notify(f"Force run failed: {e}", type="negative")
+                ui.button("Force Run Now", on_click=force_run, icon="play_arrow").props("size=sm outline")
+
+            await load_maintenance_data()
+
+
 def show_settings():
     global main_content
     if main_content is None:
@@ -1732,6 +2039,7 @@ async def on_startup():
     logger.info("Starting SigenStor Dashboard...")
     await init_db()
     await start_poller()
+    asyncio.create_task(monitor_maintenance_task())
 
     # Seed a demo reading if DB empty (helpful for first run without hardware)
     latest = await get_latest_reading()
