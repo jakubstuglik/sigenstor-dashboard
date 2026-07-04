@@ -1,97 +1,97 @@
 # SigenStor Dashboard
 
-Nowoczesna aplikacja webowa do monitorowania systemu magazynowania energii **Sigenergy SigenStor** przez Modbus TCP (tylko odczyt).
+A modern web application for monitoring the **Sigenergy SigenStor** energy storage system via Modbus TCP (read-only).
 
-## Funkcje
+## Features
 
-- **Dashboard na żywo**: karty z aktualnymi wartościami (SOC, PV, Bateria, Sieć, Zużycie), diagram Sankey przepływów energii, status systemu.
-- **Wykresy historyczne**: interaktywne wykresy Plotly (mocy, SOC, energii) z wyborem zakresu czasu.
-- **Podsumowania**: dziś/wczoraj/tydzień/miesiąc – produkcja PV, użycie baterii, import/eksport z sieci, autokonsumpcja.
-- **Dane surowe**: tabela ostatnich pomiarów + eksport CSV.
-- **Ustawienia**: konfiguracja IP, port, slave ID, interwał odpytywania + test połączenia.
-- **SQLite** do przechowywania historii.
-- Ciemny, profesjonalny motyw energy/tech.
-- Pełna obsługa błędów, logowanie, retry.
+- **Live Dashboard**: cards with current values (SOC, PV, Battery, Grid, Load), Sankey energy flow diagram, system status.
+- **Historical Charts**: interactive Plotly charts (power, SOC, energy) with time range selection.
+- **Summaries**: today/yesterday/week/month – PV production, battery usage, grid import/export, self-consumption.
+- **Raw Data**: table of recent measurements + CSV export.
+- **Settings**: IP, port, slave ID, poll interval configuration + connection test.
+- **SQLite** for history storage.
+- Dark, professional energy/tech theme.
+- Full error handling, logging, retry.
 
-## Wymagania
+## Requirements
 
 - Python 3.10+
-- SigenStor z włączonym Modbus TCP (w aplikacji mySigen: Device → Settings → Modbus TCP Server Enable)
-- IP urządzenia dostępne z komputera (domyślnie port 502, slave 247)
+- SigenStor with Modbus TCP enabled (in mySigen app: Device → Settings → Modbus TCP Server Enable)
+- Device IP accessible from the computer (default port 502, slave 247)
 
-## Instalacja i uruchomienie
+## Installation and Running
 
 ```bash
-# 1. Klonuj lub pobierz repo
+# 1. Clone or download the repo
 cd sigenstor-dashboard
 
-# 2. Utwórz venv i zainstaluj zależności
+# 2. Create venv and install dependencies
 python -m venv .venv
 .venv\Scripts\activate          # Windows (PowerShell: .\.venv\Scripts\Activate.ps1)
-# lub source .venv/bin/activate   # Linux/mac
+# or source .venv/bin/activate   # Linux/mac
 
 pip install -r requirements.txt
 
-# 3. Uruchom aplikację
+# 3. Run the app
 python main.py
 ```
 
-Aplikacja otworzy się w przeglądarce: http://localhost:8080
+The app will open in the browser: http://localhost:8080
 
-## Konfiguracja domyślna
+## Default Configuration
 
 - IP: `192.168.33.13`
 - Port: `502`
 - Slave ID: `247`
-- Interwał: `15` sekund
+- Interval: `15` seconds
 
-Przejdź do zakładki **Settings**, wpisz poprawne dane i kliknij **Save Config** + **Test Connection**.
+Go to the **Settings** tab, enter the correct data and click **Save Config** + **Test Connection**.
 
-## Struktura Modbus (podstawowa)
+## Modbus Structure (basic)
 
-Aplikacja odczytuje kluczowe rejestry (zgodne z Sigenergy Modbus Protocol ~V1.7/V2.x):
+The app reads key registers (compatible with Sigenergy Modbus Protocol ~V1.7/V2.x):
 
-| Parametr       | Adres   | Typ     | Skala   | Jednostka | Uwagi                          |
-|----------------|---------|---------|---------|-----------|--------------------------------|
-| SOC baterii    | 30014   | uint16  | 0.1     | %         |                                |
-| Moc PV         | 30035   | int32   | 0.001   | kW        | Plant Photovoltaic power       |
-| Moc baterii    | 30037   | int32   | 0.001   | kW        | + ładowanie, - rozładowanie    |
-| Moc sieci      | 30005   | int32   | 0.001   | kW        | + import, - eksport            |
-| Status grid    | 30009   | uint16  | 1       | -         | 0=OnGrid, 1/2=OffGrid          |
+| Parameter      | Address | Type    | Scale   | Unit | Notes                          |
+|----------------|---------|---------|---------|------|--------------------------------|
+| Battery SOC    | 30014   | uint16  | 0.1     | %    |                                |
+| PV Power       | 30035   | int32   | 0.001   | kW   | Plant Photovoltaic power       |
+| Battery Power  | 30037   | int32   | 0.001   | kW   | + charge, - discharge          |
+| Grid Power     | 30005   | int32   | 0.001   | kW   | + import, - export             |
+| Grid Status    | 30009   | uint16  | 1       | -    | 0=OnGrid, 1/2=OffGrid          |
 
-**Moc zużycia domu (Load)** jest obliczana: `Load = PV + Grid - Battery`
+**House Load Power** is calculated: `Load = PV + Grid - Battery`
 
-Rejestry można łatwo rozbudować w kodzie (patrz `REGISTERS` w `main.py`).
+Registers can be easily extended in the code (see `REGISTERS` in `main.py`).
 
-**Uwaga:** Upewnij się, że używasz poprawnej wersji protokołu Modbus dla Twojego firmware. Niektóre nowsze wersje (V2.8+) dodają bezpośrednie rejestry mocy obciążenia.
+**Note:** Make sure you use the correct Modbus protocol version for your firmware. Some newer versions (V2.8+) add direct load power registers.
 
-## Uruchomienie w tle / produkcja (opcjonalnie)
+## Running in Background / Production (optional)
 
-- Użyj `python main.py --host 0.0.0.0 --port 8080` aby nasłuchiwać na wszystkich interfejsach.
-- Dla stałego działania: systemd, docker, lub `nohup python main.py &`
+- Use `python main.py --host 0.0.0.0 --port 8080` to listen on all interfaces.
+- For persistent operation: systemd, docker, or `nohup python main.py &`
 
-## Rozwój / Dodawanie rejestrów
+## Development / Adding Registers
 
-1. Dodaj wpis w słowniku `REGISTERS` w `main.py`.
-2. Zaktualizuj tabelę DB (lub użyj istniejących kolumn + dodatkowe).
-3. Dodaj karty/wykresy w UI.
-4. Aplikacja jest zaprojektowana tylko do odczytu (read-only).
+1. Add an entry in the `REGISTERS` dictionary in `main.py`.
+2. Update the DB table (or use existing columns + additional ones).
+3. Add cards/charts in the UI.
+4. The app is designed read-only.
 
-## Logi i dane
+## Logs and Data
 
-- Baza: `data/sigenstor.db`
-- Logi: `logs/` (jeśli skonfigurowane)
-- Config: `config.json` (generowany przy zapisie)
+- Database: `data/sigenstor.db`
+- Logs: `logs/` (if configured)
+- Config: `config.json` (generated on save)
 
-## Bezpieczeństwo
+## Security
 
-- Tylko odczyt – żadne komendy zapisu nie są wysyłane.
-- Nie wystawiaj aplikacji publicznie bez autoryzacji (nginx, auth, VPN).
+- Read-only – no write commands are sent.
+- Do not expose the app publicly without authorization (nginx, auth, VPN).
 
-## Licencja
+## License
 
-MIT – używaj swobodnie.
+MIT – use freely.
 
 ---
 
-Stworzone zgodnie z planem w `sigenstor-monitoring-app-prompt.md`. Miłego monitorowania energii! ☀️🔋
+Created according to the plan in `sigenstor-monitoring-app-prompt.md`. Happy energy monitoring! ☀️🔋
