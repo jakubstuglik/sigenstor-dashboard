@@ -26,4 +26,6 @@
 
 ## Other Notes
 - When user reports "X doesn't work again", the first action is to reproduce with the full run + playwright + screenshot inspection cycle.
+- **Always visually inspect changes**: After every UI modification, use Playwright to capture screenshots of the affected components (e.g. gauges, charts, labels) and use `read_file` on the .png to describe the rendered result. Ensure no text clipping, sufficient spacing/gaps from edges/lines, readable font sizes (as specified: e.g. percent bigger than kWh), proper alignment, no overlaps, and that the UI looks functional and aesthetic (not cramped, titles fully visible, consistent styling). If it doesn't look good, iterate immediately. Add this as a mandatory step in testing.
 - Update this file with new lessons as they are discovered through testing.
+- **Visual QA is mandatory**: Never assume changes "look good" from code. Always capture screenshots of the exact UI component (gauges, labels, etc.) after edits, use `read_file` on the PNG to inspect for clipping (e.g. titles), font sizes (e.g. make percent larger than kWh), spacing, and overall aesthetics/legibility. Fix until it is functional and looks professional. Add explicit reminders here for future.

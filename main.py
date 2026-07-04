@@ -42,6 +42,7 @@ DEFAULT_CONFIG = {
     "enabled": True,
     "buy_price_grosze": 75,   # e.g. 75 grosze = 0.75 PLN / kWh
     "sell_price_grosze": 35,  # e.g. 35 grosze = 0.35 PLN / kWh
+    "battery_capacity_kwh": 18.0,  # default battery usable capacity in kWh (user's system: 18)
 }
 
 # Easy-to-extend Modbus register map (plant level, slave 247)
@@ -88,6 +89,40 @@ REGISTERS: Dict[str, Dict[str, Any]] = {
         "scale": 1,
         "unit": "",
         "label": "Grid Status",
+    },
+    # Battery limits (verify addresses against your Sigenergy Modbus map V1.7/V2.x)
+    "battery_max_charge_power": {
+        "addr": 30041,
+        "count": 2,
+        "dtype": "int32",
+        "scale": 0.001,
+        "unit": "kW",
+        "label": "Battery Max Charge",
+    },
+    "battery_max_discharge_power": {
+        "addr": 30043,
+        "count": 2,
+        "dtype": "int32",
+        "scale": 0.001,
+        "unit": "kW",
+        "label": "Battery Max Discharge",
+    },
+    # More useful polls (addresses are examples based on common Sigenergy maps - verify!)
+    "battery_voltage": {
+        "addr": 30039,
+        "count": 2,
+        "dtype": "int32",
+        "scale": 0.1,
+        "unit": "V",
+        "label": "Battery Voltage",
+    },
+    "inverter_temp": {
+        "addr": 30011,
+        "count": 1,
+        "dtype": "int16",
+        "scale": 0.1,
+        "unit": "°C",
+        "label": "Inverter Temp",
     },
     # Add more here easily, e.g. temperatures, phase powers, etc.
     # "plant_active_power": {"addr": 30031, "count": 2, "dtype": "int32", "scale": 0.001, "unit": "kW", ...},
@@ -140,6 +175,8 @@ class Reading:
     grid_power: Optional[float] = None
     load_power: Optional[float] = None
     grid_status: Optional[int] = None
+    battery_max_charge_power: Optional[float] = None
+    battery_max_discharge_power: Optional[float] = None
     raw: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> Dict[str, Any]:
@@ -306,6 +343,8 @@ class SigenModbusClient:
             grid_power=data.get("grid_power"),
             load_power=round(load, 3),
             grid_status=int(data.get("grid_status")) if data.get("grid_status") is not None else None,
+            battery_max_charge_power=data.get("battery_max_charge_power"),
+            battery_max_discharge_power=data.get("battery_max_discharge_power"),
             raw=raw_data,
         )
         return reading
@@ -341,7 +380,9 @@ CREATE TABLE IF NOT EXISTS measurements (
     battery_power REAL,
     grid_power REAL,
     load_power REAL,
-    grid_status INTEGER
+    grid_status INTEGER,
+    battery_max_charge_power REAL,
+    battery_max_discharge_power REAL
 );
 
 CREATE INDEX IF NOT EXISTS idx_measurements_ts ON measurements(timestamp);
@@ -361,7 +402,16 @@ async def init_db():
     DATA_DIR.mkdir(exist_ok=True)
     async with aiosqlite.connect(DB_FILE) as db:
         await db.executescript(DB_SCHEMA)
-        await db.commit()
+        # Migration for added columns (idempotent)
+        try:
+            cols = [row[1] async for row in await db.execute("PRAGMA table_info(measurements)")]
+            if "battery_max_charge_power" not in cols:
+                await db.execute("ALTER TABLE measurements ADD COLUMN battery_max_charge_power REAL")
+            if "battery_max_discharge_power" not in cols:
+                await db.execute("ALTER TABLE measurements ADD COLUMN battery_max_discharge_power REAL")
+            await db.commit()
+        except Exception:
+            pass  # ignore if already exist or other
     logger.info(f"Database ready: {DB_FILE}")
 
 
@@ -371,8 +421,8 @@ async def insert_reading(reading: Reading):
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute(
             """
-            INSERT INTO measurements (timestamp, soc, pv_power, battery_power, grid_power, load_power, grid_status)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO measurements (timestamp, soc, pv_power, battery_power, grid_power, load_power, grid_status, battery_max_charge_power, battery_max_discharge_power)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 reading.timestamp,
@@ -382,6 +432,8 @@ async def insert_reading(reading: Reading):
                 reading.grid_power,
                 reading.load_power,
                 reading.grid_status,
+                reading.battery_max_charge_power,
+                reading.battery_max_discharge_power,
             ),
         )
         await db.commit()
@@ -454,6 +506,11 @@ def compute_energy_kwh(rows: List[Dict], power_key: str) -> float:
 def get_current_prices_pln():
     cfg = load_config()
     return cfg.get("buy_price_grosze", 75) / 100.0, cfg.get("sell_price_grosze", 35) / 100.0
+
+
+def get_battery_capacity_kwh() -> float:
+    cfg = load_config()
+    return float(cfg.get("battery_capacity_kwh", 10.0))
 
 
 async def get_summary(start: datetime, end: datetime) -> Dict[str, float]:
@@ -554,6 +611,7 @@ async def start_poller():
             await asyncio.sleep(interval)
 
     poller_task = asyncio.create_task(_poll_loop())
+    asyncio.create_task(maintenance_loop())
 
 
 async def stop_poller():
@@ -567,6 +625,79 @@ async def stop_poller():
     if modbus_client:
         await modbus_client.close()
     logger.info("Poller stopped")
+
+
+async def aggregate_old_data():
+    """Aggregate measurements older than 1 day into 30s buckets to save space."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    async with aiosqlite.connect(DB_FILE) as db:
+        cur = await db.execute(
+            """SELECT timestamp, soc, pv_power, battery_power, grid_power, load_power, grid_status,
+                      battery_max_charge_power, battery_max_discharge_power
+               FROM measurements WHERE timestamp < ? ORDER BY timestamp""",
+            (cutoff,)
+        )
+        rows = await cur.fetchall()
+        if not rows:
+            return 0
+
+        from collections import defaultdict
+        buckets = defaultdict(list)
+        for row in rows:
+            ts = row[0]
+            try:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except Exception:
+                continue
+            # floor to 30s
+            secs = (dt.second // 30) * 30
+            bucket_dt = dt.replace(second=secs, microsecond=0)
+            key = bucket_dt.isoformat()
+            buckets[key].append(row[1:])
+
+        inserts = []
+        for key, group in buckets.items():
+            if not group:
+                continue
+            n = len(group)
+            def avg(idx):
+                vals = [g[idx] for g in group if g[idx] is not None]
+                return sum(vals) / len(vals) if vals else None
+            soc = avg(0)
+            pv = avg(1)
+            bat = avg(2)
+            grid = avg(3)
+            load = avg(4)
+            # status: last non-null
+            status = None
+            for g in reversed(group):
+                if g[5] is not None:
+                    status = g[5]
+                    break
+            max_ch = avg(6)
+            max_dis = avg(7)
+            inserts.append((key, soc, pv, bat, grid, load, status, max_ch, max_dis))
+
+        if inserts:
+            await db.execute("DELETE FROM measurements WHERE timestamp < ?", (cutoff,))
+            await db.executemany(
+                """INSERT INTO measurements (timestamp, soc, pv_power, battery_power, grid_power, load_power,
+                                              grid_status, battery_max_charge_power, battery_max_discharge_power)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                inserts
+            )
+            await db.commit()
+            logger.info(f"Aggregated {len(rows)} rows >1d old into {len(inserts)} 30s buckets")
+        return len(rows)
+
+
+async def maintenance_loop():
+    while True:
+        try:
+            await aggregate_old_data()
+        except Exception as e:
+            logger.error(f"Maintenance aggregation error: {e}")
+        await asyncio.sleep(3600)  # run hourly
 
 
 # =============================================================================
@@ -636,12 +767,21 @@ def create_sankey_figure(pv: float, battery: float, grid: float, load: float) ->
 
     fig = go.Figure()
     y_pos = [3, 2, 1, 0]
-    names = ["PV", "Battery", "House Load", "Grid"]
+    base_names = ["PV", "Battery", "House Load", "Grid"]
     vals = [pv, battery, load, grid]
     cols = ["#ffc107", "#4caf50", "#ff5722", "#2196f3"]
     max_abs = max(1.0, max((abs(v) for v in vals), default=1))
 
-    for name, val, y, col in zip(names, vals, y_pos, cols):
+    display_names = list(base_names)
+    # Differentiate battery charge vs discharge
+    if battery > 0.005:
+        display_names[1] = "Battery (ch)"
+        cols[1] = "#67e8f9"  # cyan for charging
+    elif battery < -0.005:
+        display_names[1] = "Battery (dis)"
+        cols[1] = "#4ade80"  # green for discharging
+
+    for idx, (name, val, y, col) in enumerate(zip(display_names, vals, y_pos, cols)):
         if abs(val) < 0.005:
             t = "0.00 kW"
         else:
@@ -654,19 +794,32 @@ def create_sankey_figure(pv: float, battery: float, grid: float, load: float) ->
             name=name,
             text=[t],
             textposition="outside",
+            textfont=dict(size=15, color="#ddd"),
         ))
+
+    # Use annotations for y labels with explicit gap from the vertical axis
+    for name, y in zip(display_names, y_pos):
+        fig.add_annotation(
+            x=-0.22 * max_abs,
+            y=y,
+            text=name,
+            xanchor="right",
+            yanchor="middle",
+            showarrow=False,
+            font=dict(color="#ddd", size=15, family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"),
+        )
 
     fig.update_layout(
         title="Power Flow (current kW) — arrows indicate typical direction",
         barmode="overlay",
-        xaxis=dict(title="|kW|", range=[0, max_abs * 1.35]),
-        yaxis=dict(tickvals=y_pos, ticktext=names, autorange="reversed"),
+        xaxis=dict(title="|kW|", range=[-0.28 * max_abs, max_abs * 1.35], showgrid=True, gridcolor="#333", zeroline=True, zerolinecolor="#444"),
+        yaxis=dict(showticklabels=False, autorange="reversed"),
         height=260,
         paper_bgcolor="#1e1e1e",
         plot_bgcolor="#1e1e1e",
-        font=dict(color="#ddd", size=11),
+        font=dict(color="#ddd", size=12, family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"),
         showlegend=False,
-        margin=dict(l=80, r=20, t=30, b=15),
+        margin=dict(l=180, r=20, t=30, b=15),
     )
     return fig
     source = []
@@ -711,10 +864,13 @@ def create_sankey_figure(pv: float, battery: float, grid: float, load: float) ->
         color.append("rgba(33, 150, 243, 0.8)")
 
 def make_soc_gauge(soc_val: float) -> go.Figure:
+    capacity = get_battery_capacity_kwh()
+    soc = soc_val or 0
+    kwh = soc * capacity / 100.0
+
     fig = go.Figure(go.Indicator(
-        mode="gauge+number",
-        value=soc_val or 0,
-        number={'suffix': "%", 'font': {'size': 36}},
+        mode="gauge",
+        value=soc,
         gauge={
             'axis': {'range': [0, 100], 'tickcolor': "#888"},
             'bar': {'color': "#00bcd4"},
@@ -723,11 +879,30 @@ def make_soc_gauge(soc_val: float) -> go.Figure:
                 {'range': [20, 50], 'color': "#fa0"},
                 {'range': [50, 100], 'color': "#4caf50"},
             ],
-            'threshold': {'line': {'color': "white", 'width': 2}, 'thickness': 0.8, 'value': soc_val or 0}
+            'threshold': {'line': {'color': "white", 'width': 2}, 'thickness': 0.8, 'value': soc}
         },
-        title={'text': "Battery SOC"}
+        # No title here to avoid clipping; the section header provides context
     ))
-    fig.update_layout(paper_bgcolor="#1e1e1e", font={'color': "#ddd"}, height=220, margin=dict(t=30, b=10, l=10, r=10))
+
+    # kWh smaller on top, percent bigger at bottom (same order as before)
+    fig.add_annotation(
+        x=0.5, y=0.28,
+        text=f"{kwh:.1f} kWh",
+        font=dict(size=18, color="#fff", family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"),
+        showarrow=False,
+        xanchor="center",
+        yanchor="middle"
+    )
+    fig.add_annotation(
+        x=0.5, y=0.08,
+        text=f"{soc:.1f}%",
+        font=dict(size=26, color="#ddd", family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"),
+        showarrow=False,
+        xanchor="center",
+        yanchor="middle"
+    )
+
+    fig.update_layout(paper_bgcolor="#1e1e1e", font={'color': "#ddd", 'family': "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"}, height=220, margin=dict(t=30, b=10, l=10, r=10))
     return fig
 
 
@@ -745,7 +920,7 @@ def make_mix_donut(pv_p, bat_p, grid_p, load_p) -> go.Figure:
     fig.update_layout(
         title="Load Supply Mix (current)",
         paper_bgcolor="#1e1e1e",
-        font={'color': "#ddd", 'size': 11},
+        font={'color': "#ddd", 'size': 11, 'family': "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"},
         height=220,
         margin=dict(t=30, b=10, l=10, r=10),
         showlegend=True,
@@ -877,40 +1052,46 @@ def update_live_dashboard():
     """Called by timer to refresh live values."""
     global latest_reading
 
-    async def ensure_latest():
-        global latest_reading
-        row = await get_latest_reading()
-        if row:
-            latest_reading = Reading(
-                timestamp=row.get("timestamp") or datetime.now(timezone.utc).isoformat(),
-                soc=row.get("soc"),
-                pv_power=row.get("pv_power"),
-                battery_power=row.get("battery_power"),
-                grid_power=row.get("grid_power"),
-                load_power=row.get("load_power"),
-                grid_status=row.get("grid_status"),
-                raw=None,
-            )
+    try:
+        async def ensure_latest():
+            global latest_reading
+            row = await get_latest_reading()
+            if row:
+                latest_reading = Reading(
+                    timestamp=row.get("timestamp") or datetime.now(timezone.utc).isoformat(),
+                    soc=row.get("soc"),
+                    pv_power=row.get("pv_power"),
+                    battery_power=row.get("battery_power"),
+                    grid_power=row.get("grid_power"),
+                    load_power=row.get("load_power"),
+                    grid_status=row.get("grid_status"),
+                    battery_max_charge_power=row.get("battery_max_charge_power"),
+                    battery_max_discharge_power=row.get("battery_max_discharge_power"),
+                    raw=None,
+                )
 
-    # Always try to have the freshest from DB
-    needs_refresh = not latest_reading
-    if latest_reading:
-        try:
-            ts = latest_reading.timestamp
-            if ts.endswith('Z'):
-                ts = ts[:-1] + '+00:00'
-            age = (datetime.now(timezone.utc) - datetime.fromisoformat(ts)).total_seconds()
-            if age > 8:
+        # Always try to have the freshest from DB
+        needs_refresh = not latest_reading
+        if latest_reading:
+            try:
+                ts = latest_reading.timestamp
+                if ts.endswith('Z'):
+                    ts = ts[:-1] + '+00:00'
+                age = (datetime.now(timezone.utc) - datetime.fromisoformat(ts)).total_seconds()
+                if age > 8:
+                    needs_refresh = True
+            except Exception:
                 needs_refresh = True
-        except Exception:
-            needs_refresh = True
-    if needs_refresh:
-        asyncio.create_task(ensure_latest())
+        if needs_refresh:
+            asyncio.create_task(ensure_latest())
 
-    if not latest_reading:
+        if not latest_reading:
+            return
+
+        r = latest_reading
+    except Exception:
+        # Prevent timer slot errors from crashing the callback
         return
-
-    r = latest_reading
 
     # Update cards (guarded)
     try:
@@ -954,6 +1135,12 @@ def update_live_dashboard():
         if 'live_mix' in globals() and live_mix is not None:
             mfig = make_mix_donut(r.pv_power, r.battery_power, r.grid_power, r.load_power)
             live_mix.update_figure(mfig)
+        if 'live_bat_max_disch' in globals() and live_bat_max_disch is not None:
+            md = r.battery_max_discharge_power
+            live_bat_max_disch.set_text(f"{md:.2f}" if md is not None else "—")
+        if 'live_bat_max_ch' in globals() and live_bat_max_ch is not None:
+            mc = r.battery_max_charge_power
+            live_bat_max_ch.set_text(f"{mc:.2f}" if mc is not None else "—")
     except Exception:
         pass  # may be stale after nav
 
@@ -980,7 +1167,7 @@ def show_dashboard():
                         with ui.row().classes("items-center gap-1"):
                             ui.icon(icon).classes(f"text-xl text-{color} flex-none")
                             ui.label(title).classes("text-[10px] text-gray-400 leading-none")
-                        val_label = ui.label("—").classes("text-[26px] font-bold leading-none mt-0.5")
+                        val_label = ui.label("—").classes("text-[26px] font-bold leading-none mt-0.5 value-num")
                         live_cards[key] = val_label
 
                 make_card("Battery SOC", "battery_charging_full", "soc", "cyan-400")
@@ -991,19 +1178,26 @@ def show_dashboard():
                 make_card("System Status", "power", "status", "gray-400")
 
             # Energy Flow (bars)
-            ui.label("Energy Flow").classes("text-xl mt-4 mb-1 font-semibold")
+            ui.label("Energy Flow").classes("text-xl mt-4 mb-1 font-semibold section-title")
             initial_fig = create_sankey_figure(0, 0, 0, 0)
             live_sankey = ui.plotly(initial_fig).classes("w-full")
 
             # New: Gauge + Donut for nice circular visuals (aesthetic + informative)
             with ui.row().classes("w-full gap-4 mt-2"):
-                ui.label("Battery Gauge & Current Load Mix").classes("text-lg font-semibold w-full")
+                ui.label("Battery Gauge & Current Load Mix").classes("text-lg font-semibold w-full section-title")
                 gauge_container = ui.column().classes("flex-1")
                 mix_container = ui.column().classes("flex-1")
 
-            global live_gauge, live_mix
+            global live_gauge, live_mix, live_bat_max_disch, live_bat_max_ch
             with gauge_container:
                 live_gauge = ui.plotly(make_soc_gauge(0)).classes("w-full")
+                with ui.row().classes("text-[10px] text-gray-400 gap-3 mt-1 justify-center"):
+                    ui.label("Max disch").classes("text-[9px]")
+                    live_bat_max_disch = ui.label("—").classes("font-mono text-gray-200 text-[11px] font-semibold")
+                    ui.label("kW").classes("text-[9px]")
+                    ui.label("  Max ch").classes("text-[9px] ml-1")
+                    live_bat_max_ch = ui.label("—").classes("font-mono text-gray-200 text-[11px] font-semibold")
+                    ui.label("kW").classes("text-[9px]")
             with mix_container:
                 live_mix = ui.plotly(make_mix_donut(0,0,0,0)).classes("w-full")
 
@@ -1011,8 +1205,8 @@ def show_dashboard():
             ui.label("Data is polled in background and saved to SQLite. Charts update automatically.").classes("text-xs text-gray-500 mt-2")
 
             # Auto-refresh timer + immediate population from DB
-            ui.timer(3.0, update_live_dashboard)
-            ui.timer(0.6, update_live_dashboard, once=True)
+            # Note: timers are created once outside to avoid slot deletion errors on navigation
+            pass  # timers created globally after initial build
 
 
 async def show_charts():
@@ -1082,14 +1276,14 @@ async def show_charts():
                                 height=200,
                                 paper_bgcolor="#1e1e1e",
                                 plot_bgcolor="#1e1e1e",
-                                font=dict(color="#ddd", size=10),
+                                font=dict(color="#ddd", size=10, family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"),
                                 margin=dict(t=25, b=5, l=40, r=10),
                                 yaxis=dict(title="grosze", gridcolor="#333", range=[0, max(1, max_g * 1.2)]),
                                 xaxis=dict(gridcolor="#333"),
                                 hoverlabel=dict(
                                     bgcolor="#1f2937",
                                     bordercolor="#374151",
-                                    font=dict(color="#e5e7eb", size=11)
+                                    font=dict(color="#e5e7eb", size=11, family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif")
                                 )
                             )
                     except Exception:
@@ -1199,7 +1393,7 @@ async def show_charts():
                             if auto_status and charts_auto_refresh_enabled:
                                 auto_status.set_text(f"Auto-refreshing every {chart_refresh_interval}s • updated {datetime.now().strftime('%H:%M:%S')}")
                         except Exception:
-                            pass
+                            pass  # protect against deleted slots on nav
                 ui.timer(2, charts_auto_tick)  # check base every 2s
                 _charts_auto_timer_started = True
                 last_chart_refresh_time = time.monotonic()
@@ -1352,6 +1546,7 @@ def show_settings():
 
             buy_price = ui.number("Buy price (grosze/kWh)", value=cfg.get("buy_price_grosze", 75), min=0, step=1).props("filled")
             sell_price = ui.number("Sell price (grosze/kWh)", value=cfg.get("sell_price_grosze", 35), min=0, step=1).props("filled")
+            bat_cap = ui.number("Battery capacity (kWh)", value=cfg.get("battery_capacity_kwh", 18.0), min=0, step=0.1).props("filled")
 
             async def test_conn():
                 test_client = SigenModbusClient(ip.value, int(port.value), int(slave.value))
@@ -1369,6 +1564,7 @@ def show_settings():
                     "poll_interval": int(interval.value),
                     "buy_price_grosze": int(buy_price.value),
                     "sell_price_grosze": int(sell_price.value),
+                    "battery_capacity_kwh": float(bat_cap.value),
                     "enabled": True,
                 }
                 save_config(new_cfg)
@@ -1429,10 +1625,36 @@ async def on_shutdown():
 # =============================================================================
 
 if __name__ in {"__main__", "__mp_main__"}:
+    # Global nicer fonts (modern sans, similar to premium UIs)
+    ui.add_head_html('''
+    <style>
+    :root {
+      --app-font: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+    }
+    body, .q-card, .q-field, .q-item, .nicegui-plotly, .q-btn, .q-tab {
+      font-family: var(--app-font) !important;
+    }
+    .value-num {
+      font-feature-settings: "tnum" !important;
+      letter-spacing: -0.02em;
+    }
+    .section-title {
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+    </style>
+    ''')
+
     # Build initial UI at top-level script execution time (required for correct NiceGUI slot context)
     build_sidebar()
     main_content = ui.column().classes("w-full")
     show_dashboard()
+
+    # Create live update timers only once at startup (prevents "parent slot deleted" errors
+    # when navigating between pages, as timers created inside show_dashboard would be
+    # children of main_content and get deleted on clear()).
+    ui.timer(3.0, update_live_dashboard)
+    ui.timer(0.6, update_live_dashboard, once=True)
 
     # Run the NiceGUI app
     ui.run(

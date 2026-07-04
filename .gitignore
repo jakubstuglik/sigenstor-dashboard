@@ -35,9 +35,14 @@ env/
 # App specific
 data/*.db
 data/*.db-journal
+data/
 config.json
 logs/*.log
+logs/
 *.log
+
+# Screenshots and test artifacts (non-code)
+screenshots/
 
 # OS
 .DS_Store
