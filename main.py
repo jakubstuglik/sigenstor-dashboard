@@ -570,6 +570,101 @@ async def get_summary(start: datetime, end: datetime) -> Dict[str, float]:
     }
 
 
+async def get_multi_period_summaries():
+    """Return list of (label, summary_dict) for Today, Yesterday, rolling Week, calendar Month, Year."""
+    now = datetime.now(timezone.utc)
+    results = []
+
+    # Today (from midnight)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    results.append(("Today", await get_summary(start, now)))
+
+    # Yesterday (full calendar day)
+    y_start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    y_end = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    results.append(("Yesterday", await get_summary(y_start, y_end)))
+
+    # Week (rolling last 7 days)
+    w_start = now - timedelta(days=7)
+    results.append(("Week (rolling)", await get_summary(w_start, now)))
+
+    # Current calendar month
+    m_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    results.append(("Month", await get_summary(m_start, now)))
+
+    # Current calendar year
+    y_start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+    results.append(("Year", await get_summary(y_start, now)))
+
+    return results
+
+
+def create_period_energy_chart(period_data):
+    """Stacked/grouped bar chart for cumulative energy flows (PV, Battery, Grid)."""
+    if not period_data:
+        fig = go.Figure()
+        fig.add_annotation(text="No data", x=0.5, y=0.5, showarrow=False)
+        return fig
+
+    labels = [item[0] for item in period_data]
+    pv = [item[1].get("pv", 0) for item in period_data]
+    bat = [item[1].get("battery_discharge", 0) for item in period_data]
+    g_in = [item[1].get("grid_import", 0) for item in period_data]
+    g_out = [item[1].get("grid_export", 0) for item in period_data]
+
+    fig = go.Figure()
+
+    # Stacked sources (makes total supply visible)
+    fig.add_trace(go.Bar(
+        x=labels, y=pv, name="☀️ PV", marker_color="#ffc107",
+        hovertemplate="PV: %{y:.2f} kWh<extra></extra>"
+    ))
+    fig.add_trace(go.Bar(
+        x=labels, y=bat, name="🔋 Battery discharge", marker_color="#4caf50",
+        hovertemplate="Battery: %{y:.2f} kWh<extra></extra>"
+    ))
+    fig.add_trace(go.Bar(
+        x=labels, y=g_in, name="⬇️ Grid import", marker_color="#2196f3",
+        hovertemplate="Grid in: %{y:.2f} kWh<extra></extra>"
+    ))
+
+    # Grid export as additional visible series (not stacked into supply)
+    fig.add_trace(go.Bar(
+        x=labels, y=g_out, name="⬆️ Grid export", marker_color="#ef4444",
+        hovertemplate="Grid out: %{y:.2f} kWh<extra></extra>"
+    ))
+
+    fig.update_layout(
+        barmode="group",  # grouped for clear comparison; switch to "stack" if preferred for supply total
+        title="Energy by Period (kWh) — PV + Battery + Grid flows",
+        yaxis_title="kWh",
+        paper_bgcolor="#1e1e1e",
+        plot_bgcolor="#1e1e1e",
+        font=dict(color="#ddd", size=10, family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"),
+        height=260,
+        margin=dict(t=30, b=5, l=40, r=10),
+        legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center"),
+        bargap=0.25,
+        xaxis=dict(gridcolor="#333"),
+        yaxis=dict(gridcolor="#333"),
+        hoverlabel=dict(bgcolor="#1f2937", bordercolor="#374151", font=dict(color="#e5e7eb", size=11))
+    )
+    return fig
+
+
+async def refresh_period_energy_chart():
+    """Top-level refresh for the period energy bar chart (can be called from live update timers)."""
+    global period_energy_chart
+    try:
+        if period_energy_chart is None:
+            return
+        pdata = await get_multi_period_summaries()
+        pfig = create_period_energy_chart(pdata)
+        period_energy_chart.update_figure(pfig)
+    except Exception:
+        pass  # guard against DB issues or UI teardown
+
+
 # =============================================================================
 # BACKGROUND POLLER
 # =============================================================================
@@ -1025,10 +1120,12 @@ live_last_update = None
 main_content = None
 live_gauge = None
 live_mix = None
+period_energy_chart = None
 _charts_auto_timer_started = False
 chart_refresh_interval = 10  # seconds for charts auto-refresh (user configurable, >=2)
 last_chart_refresh_time = 0.0  # monotonic time of last auto chart refresh
 charts_auto_refresh_enabled = True
+last_period_refresh = 0.0  # for throttling the heavier period energy chart updates
 # plots refs for in-place updates to avoid full re-creation flicker
 plots = {"power": None, "soc": None, "cost": None}
 
@@ -1066,7 +1163,7 @@ def build_sidebar():
 
 def update_live_dashboard():
     """Called by timer to refresh live values."""
-    global latest_reading
+    global latest_reading, last_period_refresh
 
     try:
         async def ensure_latest():
@@ -1161,10 +1258,20 @@ def update_live_dashboard():
     except Exception:
         pass  # may be stale after nav
 
+    # Throttled refresh for the period energy chart (updates "Today" etc. while on dashboard)
+    # Heavier query (full period summaries), so only every ~60s
+    try:
+        now = time.monotonic()
+        if now - last_period_refresh >= 60:
+            last_period_refresh = now
+            asyncio.create_task(refresh_period_energy_chart())
+    except Exception:
+        pass
+
 
 def show_dashboard():
     """Main real-time dashboard."""
-    global main_content, live_last_update, live_sankey
+    global main_content, live_last_update, live_sankey, period_energy_chart
     if main_content is None:
         main_content = ui.column().classes("w-full")
     main_content.clear()
@@ -1218,6 +1325,13 @@ def show_dashboard():
             with mix_container:
                 live_mix = ui.plotly(make_mix_donut(0,0,0,0)).classes("w-full")
 
+            # Period cumulative energy flows (new stacked/grouped bar chart)
+            ui.label("Energy by Period — PV, Battery, Grid (Today / Yesterday / Week / Month / Year)").classes("text-xl mt-4 mb-1 font-semibold section-title")
+            period_energy_chart = ui.plotly(create_period_energy_chart([])).classes("w-full")  # placeholder (updated shortly)
+
+            # initial load of period bars (once) - uses top-level refresher
+            ui.timer(0.05, lambda: asyncio.create_task(refresh_period_energy_chart()), once=True)
+
             # Quick note
             ui.label("Data is polled in background and saved to SQLite. Charts update automatically.").classes("text-xs text-gray-500 mt-2")
 
@@ -1260,7 +1374,7 @@ async def show_charts():
                     fig1 = create_power_chart(rows, f"Power (last {hours}h)")
                     fig2 = create_soc_chart(rows)
 
-                    # Price-based cost chart
+                    # Price-based net cost/revenue chart (fixed to account for exports)
                     cfig = None
                     try:
                         buy, sell = get_current_prices_pln()
@@ -1270,32 +1384,38 @@ async def show_charts():
                         for r in rows:
                             t = datetime.fromisoformat(r["timestamp"]).astimezone()
                             gp = r.get("grid_power") or 0
-                            if pt and gp > 0.01:
-                                dt = (t - pt).total_seconds() / 3600.0
-                                cum += gp * dt * buy
+                            if pt is not None:
+                                dt = max(0.0, (t - pt).total_seconds() / 3600.0)
+                                if gp > 0.001:
+                                    cum += gp * dt * buy
+                                elif gp < -0.001:
+                                    # Export: revenue reduces net cumulative cost
+                                    cum -= (-gp) * dt * sell
                             cts.append(t)
-                            cvals.append(round(cum, 2))
+                            cvals.append(round(cum, 4))
                             pt = t
                         if cvals:
-                            grosze_vals = [max(0, int(round(v * 100))) for v in cvals]
+                            grosze_vals = [int(round(v * 100)) for v in cvals]
                             cfig = go.Figure()
-                            hover_text = [f"{v:.2f} PLN ({g} gr)" for v, g in zip(cvals, grosze_vals)]
+                            hover_text = [f"Net {v:.2f} PLN ({g:+d} gr)" for v, g in zip(cvals, grosze_vals)]
                             cfig.add_trace(go.Scatter(
                                 x=cts, y=grosze_vals,
-                                name="Cumulative cost (grosze)",
+                                name="Net cumulative (grosze)",
                                 line=dict(color="#f66", width=2.5),
                                 hovertemplate="%{text}<extra></extra>",
                                 text=hover_text
                             ))
-                            max_g = max(grosze_vals) if grosze_vals else 1
+                            gmin = min(grosze_vals) if grosze_vals else 0
+                            gmax = max(grosze_vals) if grosze_vals else 1
+                            y_range = [min(gmin - 5, 0), max(gmax + 5, 1)] if grosze_vals else [0, 1]
                             cfig.update_layout(
-                                title=f"Est. Cumulative Grid Cost (buy {buy*100:.0f} gr/kWh)",
+                                title=f"Est. Cumulative Net Grid Cost (buy {int(buy*100)} / sell {int(sell*100)} gr/kWh)",
                                 height=200,
                                 paper_bgcolor="#1e1e1e",
                                 plot_bgcolor="#1e1e1e",
                                 font=dict(color="#ddd", size=10, family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"),
                                 margin=dict(t=25, b=5, l=40, r=10),
-                                yaxis=dict(title="grosze", gridcolor="#333", range=[0, max(1, max_g * 1.2)]),
+                                yaxis=dict(title="grosze (net)", gridcolor="#333", range=y_range),
                                 xaxis=dict(gridcolor="#333"),
                                 hoverlabel=dict(
                                     bgcolor="#1f2937",
