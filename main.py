@@ -870,6 +870,24 @@ async def aggregate_old_data() -> int:
                     buckets_created = len(inserts)
                     logger.info(f"Aggregated {rows_processed} rows >1d old into {buckets_created} 30s buckets")
 
+                    # Reclaim disk space. DELETE only marks pages free; VACUUM actually shrinks the .db file.
+                    try:
+                        await db.execute("VACUUM")
+                        logger.info("Database VACUUM completed after aggregation")
+                    except Exception as vac_err:
+                        logger.warning(f"VACUUM failed after aggregation: {vac_err}")
+
+                    # Prune old aggregation run history (keep last 90 days) + vacuum again if we deleted anything
+                    try:
+                        prune_cutoff = (start_ts - timedelta(days=90)).isoformat()
+                        cur = await db.execute("DELETE FROM aggregation_runs WHERE run_timestamp < ?", (prune_cutoff,))
+                        pruned = cur.rowcount
+                        if pruned and pruned > 0:
+                            await db.execute("VACUUM")
+                            logger.info(f"Pruned {pruned} old aggregation run records + re-VACUUM")
+                    except Exception as prune_err:
+                        logger.warning(f"Failed to prune old aggregation runs: {prune_err}")
+
     except Exception as e:
         status = 'error'
         error_message = str(e)
