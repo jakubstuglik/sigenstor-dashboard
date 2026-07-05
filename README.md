@@ -38,6 +38,8 @@ python main.py
 
 The app will open in the browser: http://localhost:8080
 
+**Note:** If `config.json` is missing or empty, the app will automatically create it using default settings on first run (both standalone and Docker).
+
 ## Development Setup
 
 ```bash
@@ -59,10 +61,14 @@ See `docker-compose.yml` for containerized dev/prod.
 
 ## Default Configuration
 
+If `config.json` does not exist or is empty, defaults are loaded and the file is created automatically.
+
+A `config.example.json` is provided in the repo. You can copy it to `config.json` and customize if you prefer.
+
 - IP: `192.168.33.13`
 - Port: `502`
 - Slave ID: `247`
-- Interval: `15` seconds
+- Interval: `15` seconds (default in code; current example may differ)
 
 Go to the **Settings** tab, enter the correct data and click **Save Config** + **Test Connection**.
 

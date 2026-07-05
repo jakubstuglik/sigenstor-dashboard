@@ -196,17 +196,29 @@ class Reading:
 # =============================================================================
 
 def load_config() -> Dict[str, Any]:
+    create_if_missing = False
     if CONFIG_FILE.exists():
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
+                content = f.read().strip()
+                if not content:
+                    raise ValueError("empty config file")
+                cfg = json.loads(content)
             # merge defaults
             for k, v in DEFAULT_CONFIG.items():
                 cfg.setdefault(k, v)
             return cfg
         except Exception as e:
             logger.warning(f"Failed to load config, using defaults: {e}")
-    return DEFAULT_CONFIG.copy()
+            create_if_missing = True
+    else:
+        create_if_missing = True
+
+    cfg = DEFAULT_CONFIG.copy()
+    if create_if_missing:
+        save_config(cfg)
+        logger.info("Config file created with default settings")
+    return cfg
 
 
 def save_config(cfg: Dict[str, Any]) -> None:

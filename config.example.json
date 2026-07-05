@@ -1,0 +1,19 @@
+{
+  "ip": "192.168.33.13",
+  "port": 502,
+  "slave_id": 247,
+  "poll_interval": 2,
+  "enabled": true,
+  "buy_price_grosze": 75,
+  "sell_price_grosze": 35,
+  "battery_capacity_kwh": 18.0,
+  "power_visible": {
+    "PV": true,
+    "Battery": true,
+    "Grid": true,
+    "Load": true
+  },
+  "smoothing": 0,
+  "auto_refresh_enabled": true,
+  "auto_refresh_interval": 10
+}

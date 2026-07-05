@@ -1,16 +1,36 @@
+# Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.so
 .Python
 env/
 venv/
+.venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment / secrets
 .env
+*.env
+
+# Config - user specific
+config.json
+
+# Logs and runtime data
 *.log
 server_*.txt
+logs/
+data/
+screenshots/
+
+# Temp test files
 temp_*.py
 playwright_*.log
-screenshots/
-data/*.db
-logs/
-__pycache__
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
