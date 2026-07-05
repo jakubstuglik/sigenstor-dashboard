@@ -53,11 +53,11 @@ playwright install
 python main.py
 ```
 
-Useful test files (in repo root for now):
-- `playwright_summary_test.py` - tests summary page
-- `playwright_button_highlight_test.py` etc. for UI verification
+Useful test files (see `tests/` directory):
+- `tests/playwright_summary_test.py` - tests summary page
+- `tests/playwright_button_highlight_test.py` etc. for UI verification
 
-See `docker-compose.yml` for containerized dev/prod.
+See `tests/README.md` and `docker-compose.yml` for containerized dev/prod.
 
 ## Default Configuration
 
