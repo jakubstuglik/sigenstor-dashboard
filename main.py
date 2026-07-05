@@ -557,10 +557,10 @@ def get_battery_capacity_kwh() -> float:
     return float(cfg.get("battery_capacity_kwh", 10.0))
 
 
-async def get_summary(start: datetime, end: datetime) -> Dict[str, float]:
+async def get_summary(start: datetime, end: datetime) -> Dict[str, Any]:
     rows = await get_readings_range(start, end)
     if not rows:
-        return {"pv": 0, "battery_discharge": 0, "grid_import": 0, "grid_export": 0, "load": 0, "self_consumption_pct": 0}
+        return {"pv": 0, "battery_discharge": 0, "grid_import": 0, "grid_export": 0, "load": 0, "self_sufficiency_pct": 0, "data_start": None}
 
     pv = compute_energy_kwh(rows, "pv_power")
     load = compute_energy_kwh(rows, "load_power")
@@ -588,9 +588,19 @@ async def get_summary(start: datetime, end: datetime) -> Dict[str, float]:
     grid_import = round(grid_import, 3)
     grid_export = round(grid_export, 3)
 
-    self_cons = 0.0
-    if pv > 0.001:
-        self_cons = round((pv - grid_export) / pv * 100, 1)
+    # Self-sufficiency: what % of the load (consumption) was covered by own production
+    # (PV + battery discharge) rather than grid import. This is what "Self: XX%" means
+    # in the summary context, especially when imports are near zero.
+    self_suff = 0.0
+    if load > 0.001:
+        self_energy = pv + bat_discharge - grid_import + grid_export
+        self_suff = round(max(0.0, min(100.0, self_energy / load * 100)), 2)
+
+    data_start = None
+    if rows:
+        first_ts = min(datetime.fromisoformat(r["timestamp"]) for r in rows)
+        if first_ts.date() > start.date():
+            data_start = first_ts
 
     return {
         "pv": pv,
@@ -598,7 +608,8 @@ async def get_summary(start: datetime, end: datetime) -> Dict[str, float]:
         "grid_import": grid_import,
         "grid_export": grid_export,
         "load": load,
-        "self_consumption_pct": self_cons,
+        "self_sufficiency_pct": self_suff,
+        "data_start": data_start,
     }
 
 
@@ -1822,12 +1833,25 @@ async def show_summary():
     with main_content:
         with ui.column().classes("w-full p-4 gap-6"):
             ui.label("Energy Summaries").classes("text-3xl font-bold")
+            ui.add_head_html('''
+<style>
+.q-tooltip {
+  background-color: #111827 !important;
+  border: 1px solid #d1d5db !important;
+  color: #d1d5db !important;
+  padding: 4px 8px !important;
+  border-radius: 4px !important;
+  font-size: 11px !important;
+}
+</style>
+''')
 
             periods = [
                 ("Today", 0),
                 ("Yesterday", 1),
                 ("This Week", 7),
                 ("This Month", 30),
+                ("This Year", 365),
             ]
 
             summary_container = ui.column().classes("w-full gap-4")
@@ -1838,17 +1862,18 @@ async def show_summary():
                 for name, days in periods:
                     if days == 0:
                         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                        end = now
                     elif days == 1:
                         start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
                         end = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                    elif name == "This Year":
+                        start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+                        end = now
                     else:
                         start = now - timedelta(days=days)
                         end = now
 
-                    if days == 1:
-                        summary = await get_summary(start, end)
-                    else:
-                        summary = await get_summary(start, now)
+                    summary = await get_summary(start, end)
                     summaries.append((name, summary))
 
                 buy_pln, sell_pln = get_current_prices_pln()
@@ -1856,18 +1881,41 @@ async def show_summary():
                 with summary_container:
                     for name, summary in summaries:
                         with ui.card().classes("w-full p-4 bg-[#1f2937]"):
-                            ui.label(name).classes("text-lg font-semibold mb-2 text-cyan-400")
-                            with ui.row().classes("gap-6 flex-wrap text-sm"):
-                                ui.label(f"☀️ PV: {summary['pv']:.2f} kWh")
-                                ui.label(f"🔋 Bat used: {summary['battery_discharge']:.2f} kWh")
-                                ui.label(f"⬇️ Grid in: {summary['grid_import']:.2f} kWh")
-                                ui.label(f"⬆️ Grid out: {summary['grid_export']:.2f} kWh")
-                                ui.label(f"🏠 Load: {summary['load']:.2f} kWh")
-                                ui.label(f"♻️ Self: {summary['self_consumption_pct']:.0f}%")
+                            display_name = name
+                            ds = summary.get("data_start")
+                            if ds:
+                                display_name = f"{name} (since {ds.strftime('%Y-%m-%d')})"
+                            ui.label(display_name).classes("text-lg font-semibold mb-2 text-cyan-400")
+                            def add_hint(text: str):
+                                q = ui.html('<div style="margin-left:1px;width:13px;height:13px;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;border-radius:9999px;background:#000;border:1px solid #d1d5db;color:#d1d5db;cursor:help;">?</div>')
+                                q.tooltip(text)
+                                return q
+
+                            with ui.row().classes("gap-5 flex-wrap text-sm items-center"):
+                                with ui.row().classes("items-center gap-0.5"):
+                                    ui.label(f"☀️ PV: {summary['pv']:.2f} kWh")
+                                    add_hint("Total solar energy produced (kWh) — trapezoidal integration of PV power over the period.")
+                                with ui.row().classes("items-center gap-0.5"):
+                                    ui.label(f"🔋 Bat used: {summary['battery_discharge']:.2f} kWh")
+                                    add_hint("Total energy discharged from battery (kWh) — only negative battery power integrated.")
+                                with ui.row().classes("items-center gap-0.5"):
+                                    ui.label(f"⬇️ Grid in: {summary['grid_import']:.2f} kWh")
+                                    add_hint("Total energy imported from the grid (kWh).")
+                                with ui.row().classes("items-center gap-0.5"):
+                                    ui.label(f"⬆️ Grid out: {summary['grid_export']:.2f} kWh")
+                                    add_hint("Total energy exported to the grid (kWh).")
+                                with ui.row().classes("items-center gap-0.5"):
+                                    ui.label(f"🏠 Load: {summary['load']:.2f} kWh")
+                                    add_hint("Total household consumption (kWh) — trapezoidal integration of load power.")
+                                with ui.row().classes("items-center gap-0.5"):
+                                    ui.label(f"♻️ Self: {summary['self_sufficiency_pct']:.2f}%")
+                                    add_hint("Self-sufficiency: % of consumption covered by own generation (PV + battery) instead of grid. Formula: (PV + battery - Grid import + Grid export) / Load × 100.")
                             cost = round(summary['grid_import'] * buy_pln, 2)
                             revenue = round(summary['grid_export'] * sell_pln, 2)
                             net = round(cost - revenue, 2)
-                            ui.label(f"💰 Est. cost {cost:.2f} PLN • revenue {revenue:.2f} PLN • net {net:+.2f} PLN").classes("text-xs text-gray-400 mt-1")
+                            with ui.row().classes("items-center text-xs text-gray-400 mt-1"):
+                                ui.label(f"💰 Est. cost {cost:.2f} PLN • revenue {revenue:.2f} PLN • net {net:+.2f} PLN")
+                                add_hint("Cost = Grid import × buy price. Revenue = Grid export × sell price. Net = revenue − cost.")
 
             await load_all()
 
