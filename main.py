@@ -560,13 +560,14 @@ def get_battery_capacity_kwh() -> float:
 async def get_summary(start: datetime, end: datetime) -> Dict[str, Any]:
     rows = await get_readings_range(start, end)
     if not rows:
-        return {"pv": 0, "battery_discharge": 0, "grid_import": 0, "grid_export": 0, "load": 0, "self_sufficiency_pct": 0, "data_start": None}
+        return {"pv": 0, "battery_discharge": 0, "battery_charge": 0, "grid_import": 0, "grid_export": 0, "load": 0, "self_sufficiency_pct": 0, "data_start": None}
 
     pv = compute_energy_kwh(rows, "pv_power")
     load = compute_energy_kwh(rows, "load_power")
 
     # Integrate signed flows (positive contributions only)
     bat_discharge = 0.0
+    bat_charge = 0.0
     grid_import = 0.0
     grid_export = 0.0
     for i in range(1, len(rows)):
@@ -580,11 +581,14 @@ async def get_summary(start: datetime, end: datetime) -> Dict[str, Any]:
 
         # discharge part of battery
         bat_discharge += max(0.0, -((b0 + b1) / 2.0)) * dt_h
+        # charge part of battery
+        bat_charge += max(0.0, ((b0 + b1) / 2.0)) * dt_h
         # grid import / export
         grid_import += max(0.0, ((g0 + g1) / 2.0)) * dt_h
         grid_export += max(0.0, -((g0 + g1) / 2.0)) * dt_h
 
     bat_discharge = round(bat_discharge, 3)
+    bat_charge = round(bat_charge, 3)
     grid_import = round(grid_import, 3)
     grid_export = round(grid_export, 3)
 
@@ -605,6 +609,7 @@ async def get_summary(start: datetime, end: datetime) -> Dict[str, Any]:
     return {
         "pv": pv,
         "battery_discharge": bat_discharge,
+        "battery_charge": bat_charge,
         "grid_import": grid_import,
         "grid_export": grid_export,
         "load": load,
@@ -1898,6 +1903,9 @@ async def show_summary():
                                 with ui.row().classes("items-center gap-0.5"):
                                     ui.label(f"🔋 Bat used: {summary['battery_discharge']:.2f} kWh")
                                     add_hint("Total energy discharged from battery (kWh) — only negative battery power integrated.")
+                                with ui.row().classes("items-center gap-0.5"):
+                                    ui.label(f"🔋 Bat charged: {summary['battery_charge']:.2f} kWh")
+                                    add_hint("Total energy charged into battery (kWh) — only positive battery power integrated.")
                                 with ui.row().classes("items-center gap-0.5"):
                                     ui.label(f"⬇️ Grid in: {summary['grid_import']:.2f} kWh")
                                     add_hint("Total energy imported from the grid (kWh).")
