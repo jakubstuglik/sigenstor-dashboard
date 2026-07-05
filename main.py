@@ -46,6 +46,8 @@ DEFAULT_CONFIG = {
     "battery_capacity_kwh": 18.0,  # default battery usable capacity in kWh (user's system: 18)
     "power_visible": {"PV": True, "Battery": True, "Grid": True, "Load": True},
     "smoothing": 0,  # 0=none, 3=3-reading avg, 5=5-reading avg
+    "auto_refresh_enabled": True,
+    "auto_refresh_interval": 10,
 }
 
 # Easy-to-extend Modbus register map (plant level, slave 247)
@@ -1192,10 +1194,10 @@ def create_power_chart(rows: List[Dict], title: str = "Power over time", visible
     def vis(name):
         return True if visible.get(name, True) else "legendonly"
 
-    fig.add_trace(go.Scatter(x=ts, y=pv, name="PV", line=dict(color="#ffc107", width=2), visible=vis("PV")))
-    fig.add_trace(go.Scatter(x=ts, y=bat, name="Battery", line=dict(color="#4caf50", width=2), visible=vis("Battery")))
-    fig.add_trace(go.Scatter(x=ts, y=grid, name="Grid", line=dict(color="#2196f3", width=2), visible=vis("Grid")))
-    fig.add_trace(go.Scatter(x=ts, y=load, name="Load", line=dict(color="#ff5722", width=2), visible=vis("Load")))
+    fig.add_trace(go.Scatter(x=ts, y=pv, name="PV", line=dict(color="#ffc107", width=2), visible=vis("PV"), hovertemplate="%{y:.3f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=ts, y=bat, name="Battery", line=dict(color="#4caf50", width=2), visible=vis("Battery"), hovertemplate="%{y:.3f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=ts, y=grid, name="Grid", line=dict(color="#2196f3", width=2), visible=vis("Grid"), hovertemplate="%{y:.3f}<extra></extra>"))
+    fig.add_trace(go.Scatter(x=ts, y=load, name="Load", line=dict(color="#ff5722", width=2), visible=vis("Load"), hovertemplate="%{y:.3f}<extra></extra>"))
 
     fig.update_layout(
         title=title,
@@ -1261,6 +1263,7 @@ live_gauge = None
 live_mix = None
 period_energy_chart = None
 recent_flow_values = deque(maxlen=3)  # last 3 (pv, battery, grid, load) for smoothing Energy Flow
+on_dashboard = False  # guard for live updates to avoid deleted element warnings
 _charts_auto_timer_started = False
 chart_refresh_interval = 10  # seconds for charts auto-refresh (user configurable, >=2)
 last_chart_refresh_time = 0.0  # monotonic time of last auto chart refresh
@@ -1310,7 +1313,10 @@ def build_sidebar():
 
 def update_live_dashboard():
     """Called by timer to refresh live values."""
-    global latest_reading, last_period_refresh, recent_flow_values
+    global latest_reading, last_period_refresh, recent_flow_values, on_dashboard
+
+    if not on_dashboard:
+        return
 
     try:
         async def ensure_latest():
@@ -1439,7 +1445,8 @@ def update_live_dashboard():
 
 def show_dashboard():
     """Main real-time dashboard."""
-    global main_content, live_last_update, live_sankey, period_energy_chart
+    global main_content, live_last_update, live_sankey, period_energy_chart, on_dashboard
+    on_dashboard = True
     if main_content is None:
         main_content = ui.column().classes("w-full")
     main_content.clear()
@@ -1509,7 +1516,8 @@ def show_dashboard():
 
 
 async def show_charts():
-    global main_content, current_range, smoothing, power_visible, auto_status
+    global main_content, current_range, smoothing, power_visible, auto_status, charts_auto_refresh_enabled, chart_refresh_interval, on_dashboard
+    on_dashboard = False
     if main_content is None:
         main_content = ui.column().classes("w-full")
     main_content.clear()
@@ -1529,6 +1537,8 @@ async def show_charts():
             current_range["hours"] = 1
             power_visible = cfg.get("power_visible", {"PV": True, "Battery": True, "Grid": True, "Load": True}).copy()
             smoothing = cfg.get("smoothing", 0)
+            charts_auto_refresh_enabled = bool(cfg.get("auto_refresh_enabled", True))
+            chart_refresh_interval = int(cfg.get("auto_refresh_interval", 10))
             chart_container = None
             auto_status = None
             pause_btn = None
@@ -1655,7 +1665,7 @@ async def show_charts():
                                 else:
                                     auto_status.set_text("Auto-refresh PAUSED — use Refresh or range buttons to update")
                         return hnd
-                    btn = ui.button(label, on_click=make_handler()).props("outline color=primary size=sm")
+                    btn = ui.button(label, on_click=make_handler()).props("size=sm")
                     period_buttons[hours] = btn
 
                 ui.separator().props("vertical").classes("mx-1 h-6")
@@ -1673,6 +1683,13 @@ async def show_charts():
                         if val < 2:
                             val = 2
                         chart_refresh_interval = val
+                        # persist the interval too
+                        try:
+                            c = load_config()
+                            c["auto_refresh_interval"] = chart_refresh_interval
+                            save_config(c)
+                        except Exception:
+                            pass
                         if auto_status:
                             auto_status.set_text(f"Auto-refreshing every {val}s — will take effect on next tick")
                     except Exception:
@@ -1683,6 +1700,13 @@ async def show_charts():
                 def toggle_auto_refresh():
                     global charts_auto_refresh_enabled, last_chart_refresh_time
                     charts_auto_refresh_enabled = not charts_auto_refresh_enabled
+                    # persist auto-refresh enabled state
+                    try:
+                        c = load_config()
+                        c["auto_refresh_enabled"] = charts_auto_refresh_enabled
+                        save_config(c)
+                    except Exception:
+                        pass
                     if pause_btn:
                         pause_btn.set_text("▶ Resume Auto-Refresh" if not charts_auto_refresh_enabled else "⏸ Pause Auto-Refresh")
                     if auto_status:
@@ -1692,7 +1716,8 @@ async def show_charts():
                         else:
                             auto_status.set_text("Auto-refresh PAUSED — use Refresh or range buttons to update")
 
-                pause_btn = ui.button("⏸ Pause Auto-Refresh", on_click=toggle_auto_refresh).props("size=sm outline color=primary")
+                initial_pause_text = "▶ Resume Auto-Refresh" if not charts_auto_refresh_enabled else "⏸ Pause Auto-Refresh"
+                pause_btn = ui.button(initial_pause_text, on_click=toggle_auto_refresh).props("size=sm outline color=primary")
 
                 async def do_refresh():
                     await load_and_render(current_range["hours"])
@@ -1706,18 +1731,20 @@ async def show_charts():
             def update_active_button(active_hours):
                 for h, btn in period_buttons.items():
                     if h == active_hours:
-                        btn.props("color=primary").props(remove="outline")
+                        btn.props("color=primary size=sm")  # filled blue like APPLY/RESUME
                     else:
-                        btn.props("outline color=primary").props(remove="color")
+                        btn.props("outline color=primary size=sm")
+                        btn.classes("border-primary text-primary")  # blue border + blue text for unselected like PAUSE
 
             update_active_button(current_range["hours"])
 
             def update_smoothing_buttons(active_smoothing):
                 for s, btn in smoothing_buttons.items():
                     if s == active_smoothing:
-                        btn.props("color=primary").props(remove="outline")
+                        btn.props("color=primary size=sm")  # filled blue like APPLY/RESUME
                     else:
-                        btn.props("outline color=primary").props(remove="color")
+                        btn.props("outline color=primary size=sm")
+                        btn.classes("border-primary text-primary")  # blue border + blue text for unselected like PAUSE
 
             # Status immediately after controls (still top area)
             auto_status = ui.label(f"Auto-refreshing every {chart_refresh_interval}s").classes("text-xs text-green-400 mb-2")
@@ -1755,7 +1782,7 @@ async def show_charts():
                                 await load_and_render(current_range["hours"])
                                 update_smoothing_buttons(sm)
                             return hnd
-                        btn = ui.button(label, on_click=make_s_handler()).props("outline color=primary size=sm")
+                        btn = ui.button(label, on_click=make_s_handler()).props("size=sm")
                         smoothing_buttons[s] = btn
 
             update_smoothing_buttons(smoothing)
@@ -1787,7 +1814,8 @@ async def show_charts():
 
 
 async def show_summary():
-    global main_content
+    global main_content, on_dashboard
+    on_dashboard = False
     if main_content is None:
         main_content = ui.column().classes("w-full")
     main_content.clear()
@@ -1845,7 +1873,8 @@ async def show_summary():
 
 
 async def show_raw_data():
-    global main_content
+    global main_content, on_dashboard
+    on_dashboard = False
     if main_content is None:
         main_content = ui.column().classes("w-full")
     main_content.clear()
@@ -1914,7 +1943,8 @@ async def show_raw_data():
 
 async def show_maintenance():
     """UI section for aggregation task history, status, and monitoring."""
-    global main_content
+    global main_content, on_dashboard
+    on_dashboard = False
     if main_content is None:
         main_content = ui.column().classes("w-full")
     main_content.clear()
@@ -2066,7 +2096,8 @@ async def show_maintenance():
 
 
 def show_settings():
-    global main_content
+    global main_content, on_dashboard
+    on_dashboard = False
     if main_content is None:
         main_content = ui.column().classes("w-full")
     main_content.clear()
