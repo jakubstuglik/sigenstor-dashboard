@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  sigenstor-dashboard:
+    build: .
+    container_name: sigenstor-dashboard
+    restart: unless-stopped
+
+    # Port mapping for the web UI
+    ports:
+      - "8080:8080"
+
+    # IMPORTANT: Use the same data and logs as the standalone version
+    # This ensures the SQLite DB and log files are shared and persist across container recreates/restarts
+    volumes:
+      # Database volume (same as running python main.py directly)
+      - ./data:/app/data
+      # Logs volume (daily log files)
+      - ./logs:/app/logs
+      # Config (recommended to keep the same settings as standalone)
+      - ./config.json:/app/config.json
+
+    # Environment
+    environment:
+      - PYTHONUNBUFFERED=1
+      # Optional: TZ=Europe/Warsaw  (adjust to your timezone)
+
+    # Networking:
+    # We use standard bridge networking + port publishing for broad compatibility
+    # (especially on Windows Docker Desktop and macOS).
+    #
+    # If you have trouble reaching your Modbus device (192.168.x etc.) from inside
+    # the container, you can try uncommenting the line below on Linux hosts:
+    # network_mode: "host"
+    #
+    # On Windows/macOS, leave it commented. The container should still reach
+    # devices on your LAN. If not, use the host's IP in config.json or add:
+    # extra_hosts:
+    #   - "host.docker.internal:host-gateway"
+
+    # Healthcheck (optional but useful)
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('127.0.0.1', 8080)); s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+    # Resource limits (optional)
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: '1.0'
+    #       memory: 512M
