@@ -44,6 +44,8 @@ DEFAULT_CONFIG = {
     "buy_price_grosze": 75,   # e.g. 75 grosze = 0.75 PLN / kWh
     "sell_price_grosze": 35,  # e.g. 35 grosze = 0.35 PLN / kWh
     "battery_capacity_kwh": 18.0,  # default battery usable capacity in kWh (user's system: 18)
+    "power_visible": {"PV": True, "Battery": True, "Grid": True, "Load": True},
+    "smoothing": 0,  # 0=none, 3=3-reading avg, 5=5-reading avg
 }
 
 # Easy-to-extend Modbus register map (plant level, slave 247)
@@ -1169,11 +1171,15 @@ def make_mix_donut(pv_p, bat_p, grid_p, load_p) -> go.Figure:
     return fig
 
 
-def create_power_chart(rows: List[Dict], title: str = "Power over time") -> go.Figure:
+def create_power_chart(rows: List[Dict], title: str = "Power over time", visible: dict = None) -> go.Figure:
     if not rows:
         fig = go.Figure()
         fig.add_annotation(text="No data", x=0.5, y=0.5, showarrow=False)
         return fig
+
+    if visible is None:
+        cfg = load_config()
+        visible = cfg.get("power_visible", {"PV": True, "Battery": True, "Grid": True, "Load": True}).copy()
 
     ts = [datetime.fromisoformat(r["timestamp"]).astimezone() for r in rows]
     pv = [r.get("pv_power") or 0 for r in rows]
@@ -1182,10 +1188,14 @@ def create_power_chart(rows: List[Dict], title: str = "Power over time") -> go.F
     load = [r.get("load_power") or 0 for r in rows]
 
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=ts, y=pv, name="PV", line=dict(color="#ffc107", width=2)))
-    fig.add_trace(go.Scatter(x=ts, y=bat, name="Battery", line=dict(color="#4caf50", width=2)))
-    fig.add_trace(go.Scatter(x=ts, y=grid, name="Grid", line=dict(color="#2196f3", width=2)))
-    fig.add_trace(go.Scatter(x=ts, y=load, name="Load", line=dict(color="#ff5722", width=2, dash="dot")))
+
+    def vis(name):
+        return True if visible.get(name, True) else "legendonly"
+
+    fig.add_trace(go.Scatter(x=ts, y=pv, name="PV", line=dict(color="#ffc107", width=2), visible=vis("PV")))
+    fig.add_trace(go.Scatter(x=ts, y=bat, name="Battery", line=dict(color="#4caf50", width=2), visible=vis("Battery")))
+    fig.add_trace(go.Scatter(x=ts, y=grid, name="Grid", line=dict(color="#2196f3", width=2), visible=vis("Grid")))
+    fig.add_trace(go.Scatter(x=ts, y=load, name="Load", line=dict(color="#ff5722", width=2), visible=vis("Load")))
 
     fig.update_layout(
         title=title,
@@ -1258,6 +1268,10 @@ charts_auto_refresh_enabled = True
 last_period_refresh = 0.0  # for throttling the heavier period energy chart updates
 # plots refs for in-place updates to avoid full re-creation flicker
 plots = {"power": None, "soc": None, "cost": None}
+
+current_range = {"hours": 1}
+smoothing = 0
+power_visible = {"PV": True, "Battery": True, "Grid": True, "Load": True}
 
 
 def build_sidebar():
@@ -1460,9 +1474,9 @@ def show_dashboard():
             initial_fig = create_sankey_figure(0, 0, 0, 0)
             live_sankey = ui.plotly(initial_fig).classes("w-full")
 
-            # New: Gauge + Donut for nice circular visuals (aesthetic + informative)
-            with ui.row().classes("w-full gap-4 mt-2"):
-                ui.label("Battery Gauge & Current Load Mix").classes("text-lg font-semibold w-full section-title")
+            # Battery Gauge and Load Mix side-by-side
+            ui.label("Battery Gauge & Current Load Mix").classes("text-lg font-semibold mt-2")
+            with ui.row().classes("w-full gap-4"):
                 gauge_container = ui.column().classes("flex-1")
                 mix_container = ui.column().classes("flex-1")
 
@@ -1495,7 +1509,7 @@ def show_dashboard():
 
 
 async def show_charts():
-    global main_content
+    global main_content, current_range, smoothing, power_visible, auto_status
     if main_content is None:
         main_content = ui.column().classes("w-full")
     main_content.clear()
@@ -1511,21 +1525,44 @@ async def show_charts():
                 ("Last 7 days", 24*7),
                 ("Last 30 days", 24*30),
             ]
-            current_range = {"hours": 24}
+            cfg = load_config()
+            current_range["hours"] = 1
+            power_visible = cfg.get("power_visible", {"PV": True, "Battery": True, "Grid": True, "Load": True}).copy()
+            smoothing = cfg.get("smoothing", 0)
             chart_container = None
             auto_status = None
             pause_btn = None
             # reset per-visit plot refs
             plots["power"] = plots["soc"] = plots["cost"] = None
 
+            period_buttons = {}
+            smoothing_buttons = {}
+
+            def _smooth_rows(rows, window):
+                if window < 2 or len(rows) < 2:
+                    return rows
+                smoothed = [dict(r) for r in rows]
+                keys = ["pv_power", "battery_power", "grid_power", "load_power", "soc"]
+                for key in keys:
+                    for i in range(len(smoothed)):
+                        start = max(0, i - window + 1)
+                        vals = [smoothed[j].get(key) for j in range(start, i + 1) if smoothed[j].get(key) is not None]
+                        if vals:
+                            smoothed[i][key] = sum(vals) / len(vals)
+                return smoothed
+
             # Define load first (closures will resolve names at runtime)
             async def load_and_render(hours: int, from_auto: bool = False):
+                global current_range, smoothing, power_visible, auto_status
                 try:
                     since = datetime.now(timezone.utc) - timedelta(hours=hours)
                     rows = await get_readings_since(since)
 
+                    if smoothing > 1:
+                        rows = _smooth_rows(rows, smoothing)
+
                     # Always build fresh figures
-                    fig1 = create_power_chart(rows, f"Power (last {hours}h)")
+                    fig1 = create_power_chart(rows, f"Power (last {hours}h)", visible=power_visible)
                     fig2 = create_soc_chart(rows)
 
                     # Price-based net cost/revenue chart (fixed to account for exports)
@@ -1611,13 +1648,15 @@ async def show_charts():
                         async def hnd():
                             current_range["hours"] = h
                             await load_and_render(h)
+                            update_active_button(h)
                             if auto_status:
                                 if charts_auto_refresh_enabled:
                                     auto_status.set_text(f"Auto-refreshing every {chart_refresh_interval}s — preset active")
                                 else:
                                     auto_status.set_text("Auto-refresh PAUSED — use Refresh or range buttons to update")
                         return hnd
-                    ui.button(label, on_click=make_handler()).props("outline size=sm")
+                    btn = ui.button(label, on_click=make_handler()).props("outline color=primary size=sm")
+                    period_buttons[hours] = btn
 
                 ui.separator().props("vertical").classes("mx-1 h-6")
 
@@ -1653,7 +1692,7 @@ async def show_charts():
                         else:
                             auto_status.set_text("Auto-refresh PAUSED — use Refresh or range buttons to update")
 
-                pause_btn = ui.button("⏸ Pause Auto-Refresh", on_click=toggle_auto_refresh).props("size=sm outline")
+                pause_btn = ui.button("⏸ Pause Auto-Refresh", on_click=toggle_auto_refresh).props("size=sm outline color=primary")
 
                 async def do_refresh():
                     await load_and_render(current_range["hours"])
@@ -1664,8 +1703,62 @@ async def show_charts():
                             auto_status.set_text("Auto-refresh PAUSED — use Refresh or range buttons to update")
                 ui.button("Refresh Charts", on_click=do_refresh, icon="refresh").props("size=sm")
 
+            def update_active_button(active_hours):
+                for h, btn in period_buttons.items():
+                    if h == active_hours:
+                        btn.props("color=primary").props(remove="outline")
+                    else:
+                        btn.props("outline color=primary").props(remove="color")
+
+            update_active_button(current_range["hours"])
+
+            def update_smoothing_buttons(active_smoothing):
+                for s, btn in smoothing_buttons.items():
+                    if s == active_smoothing:
+                        btn.props("color=primary").props(remove="outline")
+                    else:
+                        btn.props("outline color=primary").props(remove="color")
+
             # Status immediately after controls (still top area)
             auto_status = ui.label(f"Auto-refreshing every {chart_refresh_interval}s").classes("text-xs text-green-400 mb-2")
+
+            # Power series toggles + smoothing buttons (on right)
+            with ui.row().classes("w-full gap-2 mb-2 items-center flex-wrap"):
+                ui.label("Power:").classes("text-xs text-gray-400 mr-1")
+                for name, color in [("PV", "#ffc107"), ("Battery", "#4caf50"), ("Grid", "#2196f3"), ("Load", "#ff5722")]:
+                    def make_toggle(n=name, c=color):
+                        async def on_change(e):
+                            power_visible[n] = e.value
+                            cfg = load_config()
+                            cfg["power_visible"] = power_visible
+                            save_config(cfg)
+                            await load_and_render(current_range["hours"])
+                        ui.html(f'<span style="color:{c}; font-weight:bold; margin-right:1px;">●</span>')
+                        ui.switch(n, value=power_visible.get(n, True), on_change=on_change).props("dense size=sm")
+                    make_toggle()
+
+                # Smoothing buttons on the right
+                with ui.row().classes("ml-auto gap-1"):
+                    smoothing_options = [
+                        ("No smoothing", 0),
+                        ("3 last", 3),
+                        ("5 last", 5),
+                    ]
+                    for label, s in smoothing_options:
+                        def make_s_handler(sm=s):
+                            async def hnd():
+                                global smoothing
+                                smoothing = sm
+                                cfg = load_config()
+                                cfg["smoothing"] = smoothing
+                                save_config(cfg)
+                                await load_and_render(current_range["hours"])
+                                update_smoothing_buttons(sm)
+                            return hnd
+                        btn = ui.button(label, on_click=make_s_handler()).props("outline color=primary size=sm")
+                        smoothing_buttons[s] = btn
+
+            update_smoothing_buttons(smoothing)
 
             # chart_container created here so plots appear below the top controls+status
             chart_container = ui.column().classes("w-full gap-6")
@@ -1675,7 +1768,7 @@ async def show_charts():
             global _charts_auto_timer_started
             if not _charts_auto_timer_started:
                 async def charts_auto_tick():
-                    global last_chart_refresh_time
+                    global last_chart_refresh_time, current_range, auto_status
                     now = time.monotonic()
                     if charts_auto_refresh_enabled and (now - last_chart_refresh_time >= chart_refresh_interval):
                         last_chart_refresh_time = now
@@ -2001,17 +2094,16 @@ def show_settings():
                     ui.notify(msg, type="negative", position="top")
 
             async def save_and_apply():
-                new_cfg = {
-                    "ip": ip.value.strip(),
-                    "port": int(port.value),
-                    "slave_id": int(slave.value),
-                    "poll_interval": int(interval.value),
-                    "buy_price_grosze": int(buy_price.value),
-                    "sell_price_grosze": int(sell_price.value),
-                    "battery_capacity_kwh": float(bat_cap.value),
-                    "enabled": True,
-                }
-                save_config(new_cfg)
+                cfg = load_config()
+                cfg["ip"] = ip.value.strip()
+                cfg["port"] = int(port.value)
+                cfg["slave_id"] = int(slave.value)
+                cfg["poll_interval"] = int(interval.value)
+                cfg["buy_price_grosze"] = int(buy_price.value)
+                cfg["sell_price_grosze"] = int(sell_price.value)
+                cfg["battery_capacity_kwh"] = float(bat_cap.value)
+                cfg["enabled"] = True
+                save_config(cfg)
                 ui.notify("Config saved. Restarting poller...", type="info")
                 await stop_poller()
                 await start_poller()

@@ -1,5 +1,26 @@
 # AGENTS.md - Important Rules for Working on SigenStor Dashboard
 
+## Mandatory: Always Test Your Changes with Playwright (No Exceptions)
+**You must test EVERY change you make using the full procedure below before claiming it is done.** This is non-negotiable. If the user reports an internal server error, blank UI, or broken feature, reproduce it immediately with a fresh server start + Playwright navigation + interaction + screenshots + read_file inspection + log check. Fix the root cause, re-test the entire flow (including clicking the new controls like smoothing buttons), and loop until the UI renders cleanly with no 500 errors and the feature works visually. Document lessons learned by updating this file. Never rely on "it looks correct in code" or previous test runs.
+
+## Mandatory Testing of All Changes (Playwright + Visual Inspection Loop)
+**Testing your changes with Playwright is MANDATORY for every modification.** Never skip this step. After editing code (especially UI, state, buttons, toggles, or handlers that affect the Charts page or config persistence):
+
+1. Start/restart the server in background or with monitor: `python main.py`.
+2. Use a Playwright script (python -c or temp_test_playwright.py or test_ui.py) to:
+   - Navigate to http://localhost:8080
+   - Click "CHARTS" in sidebar
+   - Interact with the new controls: the Power series switches (toggles), AND the new smoothing buttons ("No smoothing", "3 last", "5 last").
+   - Click period buttons too.
+   - Observe if charts update without Internal Server Error (500), blank areas, or crashes.
+3. Save full_page screenshots after navigation and after clicking each new button (e.g. screenshots/charts_after_5_last.png).
+4. Immediately use the `read_file` tool on the .png screenshot files — the tool will use a multimodal model to describe exactly what is rendered (look for the buttons on the right of the power toggles row, highlighted active smoothing button with blue, no error messages, charts visible and updating).
+5. Check the server output/logs (from the background task or logs/sigenstor_*.log) for any exceptions, tracebacks, or "Internal Server Error".
+6. If error (e.g. ISE, AttributeError, NameError, stale element, or buttons not appearing/clickable), diagnose (read code + logs + screenshot description), fix, re-start server, re-run playwright test, re-read screenshots, repeat the loop **until no errors and visual confirmation that it works**.
+7. Only after successful visual + log confirmation in the loop, consider the change complete. Update this AGENTS.md with any new gotchas found.
+
+**This is non-negotiable.** Historical problems like the global declaration order causing SyntaxError (leading to ISE on startup), stale closures breaking auto-refresh, or layout/button issues only appear at runtime. Always loop the test-fix cycle.
+
 ## Mandatory Testing Procedure for Every Change
 **You MUST test every code change yourself before considering it done:**
 
