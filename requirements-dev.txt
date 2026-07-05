@@ -1,0 +1,10 @@
+# Development and testing dependencies for SigenStor Dashboard
+
+-r requirements.txt
+
+# Playwright for UI testing
+playwright>=1.40.0
+
+# Optional: code formatting and linting
+# black>=24.0.0
+# flake8>=7.0.0

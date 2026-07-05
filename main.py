@@ -729,6 +729,9 @@ async def start_poller():
     if poller_task and not poller_task.done():
         poller_task.cancel()
 
+    if maintenance_task and not maintenance_task.done():
+        maintenance_task.cancel()
+
     current_config = load_config()
     modbus_client = SigenModbusClient(
         current_config["ip"],
@@ -960,20 +963,24 @@ async def monitor_maintenance_task():
         if maintenance_task is None:
             continue
         if maintenance_task.done():
+            restarted = False
             try:
                 exc = maintenance_task.exception()
                 if exc:
                     logger.error(f"Maintenance task crashed: {exc}")
+                    restarted = True
             except asyncio.CancelledError:
                 logger.info("Maintenance task was cancelled")
             except Exception as e:
                 logger.error(f"Error inspecting maintenance task: {e}")
-            logger.warning("Maintenance task stopped unexpectedly. Restarting...")
-            try:
-                maintenance_task = asyncio.create_task(maintenance_loop())
-                logger.info("Maintenance task restarted")
-            except Exception as restart_err:
-                logger.error(f"Failed to restart maintenance task: {restart_err}")
+                restarted = True
+            if restarted:
+                logger.warning("Maintenance task stopped unexpectedly. Restarting...")
+                try:
+                    maintenance_task = asyncio.create_task(maintenance_loop())
+                    logger.info("Maintenance task restarted")
+                except Exception as restart_err:
+                    logger.error(f"Failed to restart maintenance task: {restart_err}")
 
 
 # =============================================================================

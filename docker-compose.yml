@@ -4,7 +4,7 @@ services:
   sigenstor-dashboard:
     build: .
     container_name: sigenstor-dashboard
-    restart: unless-stopped
+    restart: always
 
     # Port mapping for the web UI
     ports:

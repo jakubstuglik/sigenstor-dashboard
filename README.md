@@ -38,6 +38,25 @@ python main.py
 
 The app will open in the browser: http://localhost:8080
 
+## Development Setup
+
+```bash
+# Install dev dependencies (includes playwright for UI tests)
+pip install -r requirements-dev.txt
+
+# Install Playwright browsers
+playwright install
+
+# Run the app
+python main.py
+```
+
+Useful test files (in repo root for now):
+- `playwright_summary_test.py` - tests summary page
+- `playwright_button_highlight_test.py` etc. for UI verification
+
+See `docker-compose.yml` for containerized dev/prod.
+
 ## Default Configuration
 
 - IP: `192.168.33.13`
