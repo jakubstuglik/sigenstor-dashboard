@@ -58,9 +58,19 @@ def _ensure_dev_db_seeded() -> None:
     # This guarantees ac1 "seed with schema and settings from prod DB" and eliminates small/empty dev cases.
     if PROD_DB_FILE.exists():
         try:
-            import sqlite3
-            # Prefer sqlite3 backup API for clean, consistent snapshot (avoids malformed image and lock races vs shutil)
-            if DB_FILE.exists():
+            import sqlite3, os
+            dev_exists = DB_FILE.exists()
+            dev_size = os.path.getsize(DB_FILE) if dev_exists else 0
+            # Only seed (overwrite) if dev missing or suspiciously small/empty. 
+            # NEVER nuke a populated dev DB on every import (would destroy daily/power_agg work, contrary to user instructions).
+            if dev_exists and dev_size > 100 * 1024:  # >100kB means has real data + schema
+                try:
+                    logger.info(f"Dev DB already populated ({dev_size} bytes), skipping re-seed to preserve aggregates.")
+                except Exception:
+                    print(f"Dev DB populated, skip re-seed.")
+                return
+            # Prefer sqlite3 backup API ...
+            if dev_exists:
                 try:
                     DB_FILE.unlink()
                 except Exception:
@@ -202,38 +212,93 @@ def _compress_log(source: Path, dest: Path) -> None:
     """Compress a rotated log file using gzip."""
     import gzip
     import shutil
-    with open(source, 'rb') as f_in:
-        with gzip.open(dest, 'wb') as f_out:
-            shutil.copyfileobj(f_in, f_out)
-    source.unlink(missing_ok=True)
+    try:
+        with open(source, 'rb') as f_in:
+            with gzip.open(dest, 'wb') as f_out:
+                shutil.copyfileobj(f_in, f_out)
+        source.unlink(missing_ok=True)
+    except Exception as e:
+        try:
+            logger.warning(f"Log compression failed for {source}: {e}")
+        except Exception:
+            pass
+
+def _compress_uncompressed_rotated() -> None:
+    """On startup, gzip any existing rotated plain .log files (e.g. sigenstor_YYYYMMDD.log) so they don't stay huge uncompressed."""
+    import gzip
+    import shutil
+    active = LOGS_DIR / "sigenstor.log"
+    for f in LOGS_DIR.glob("sigenstor_*.log"):
+        if f.name == "sigenstor.log":
+            continue
+        gz = f.with_suffix(f.suffix + ".gz") if not f.name.endswith('.gz') else f
+        # if .log make .log.gz
+        if not str(gz).endswith('.gz'):
+            gz = Path(str(f) + '.gz')
+        if gz.exists():
+            try:
+                f.unlink(missing_ok=True)
+            except Exception:
+                pass
+            continue
+        try:
+            with open(f, 'rb') as f_in:
+                with gzip.open(gz, 'wb') as f_out:
+                    shutil.copyfileobj(f_in, f_out)
+            f.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 def _cleanup_old_logs(days: int = 30) -> None:
-    """Delete log files older than N days (including .gz)."""
+    """Delete log files older than N days (including .gz). Uses name date or mtime fallback."""
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     for f in LOGS_DIR.glob("sigenstor_*.log*"):
         try:
-            # parse date from name like sigenstor_20260712.log or .log.1.gz
-            stem = f.stem.split('.')[0] if '.' in f.name else f.stem
-            if stem.startswith('sigenstor_'):
-                date_str = stem.split('_', 1)[1][:8]
-                if len(date_str) == 8:
-                    log_date = datetime.strptime(date_str, '%Y%m%d').replace(tzinfo=timezone.utc)
-                    if log_date < cutoff:
-                        f.unlink(missing_ok=True)
+            delete = False
+            parsed = False
+            # parse date from name like sigenstor_20260712.log or sigenstor_20260712.log.gz
+            name = f.name
+            if '_20' in name or '_19' in name:
+                # find YYYYMMDD after last _
+                parts = name.replace('.log', '').replace('.gz', '').split('_')
+                for p in parts:
+                    if len(p) == 8 and p.isdigit():
+                        log_date = datetime.strptime(p, '%Y%m%d').replace(tzinfo=timezone.utc)
+                        if log_date < cutoff:
+                            delete = True
+                        parsed = True
+                        break
+            if not parsed:
+                # fallback to file mtime
+                mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
+                if mtime < cutoff:
+                    delete = True
+            if delete:
+                f.unlink(missing_ok=True)
+                try:
+                    logger.debug(f"Cleaned old log: {f.name}")
+                except Exception:
+                    pass
         except Exception:
             pass
 
 def setup_logging():
     LOGS_DIR.mkdir(exist_ok=True)
 
-    # Use daily rotating file handler with compression and retention
+    # Use daily rotating file handler with compression and retention.
+    # We compress rotated files to .gz and clean old ones (name date or mtime).
     log_file = LOGS_DIR / "sigenstor.log"
 
     handler = logging.handlers.TimedRotatingFileHandler(
-        log_file, when='midnight', interval=1, backupCount=30, encoding='utf-8'
+        log_file, when='midnight', interval=1, backupCount=0, encoding='utf-8'
     )
-    handler.namer = lambda name: str(Path(name).with_suffix(''))  # keep .log
-    handler.rotator = lambda source, dest: _compress_log(Path(source), Path(dest).with_suffix('.log.gz'))
+    # Custom namer keeps a clean base; rotator gzips the rotated file.
+    def _log_namer(name: str) -> str:
+        p = Path(name)
+        # TimedRotating appends date suffix; keep .log then rotator will .gz it
+        return str(p.with_suffix(''))
+    handler.namer = _log_namer
+    handler.rotator = lambda source, dest: _compress_log(Path(source), Path(dest).with_name(Path(dest).name + '.gz') if not str(dest).endswith('.gz') else Path(dest))
 
     logging.basicConfig(
         level=logging.INFO,
@@ -244,7 +309,11 @@ def setup_logging():
         ],
     )
 
-    # Cleanup old on startup
+    # On startup: compress any leftover uncompressed rotated logs, then enforce retention
+    try:
+        _compress_uncompressed_rotated()
+    except Exception:
+        pass
     try:
         _cleanup_old_logs(30)
     except Exception:
@@ -345,7 +414,7 @@ class SigenModbusClient:
             self.client = AsyncModbusTcpClient(host=self.ip, port=self.port, timeout=5)
             self.connected = await self.client.connect()
             if self.connected:
-                logger.info(f"Connected to Modbus TCP at {self.ip}:{self.port}")
+                logger.debug(f"Connected to Modbus TCP at {self.ip}:{self.port}")
             else:
                 logger.warning("Modbus connect returned False")
             return self.connected
@@ -518,6 +587,21 @@ CREATE TABLE IF NOT EXISTS energy_daily (
     load_energy_kwh REAL DEFAULT 0
 );
 
+-- power_agg stores pre-aggregated (downsampled) power readings for older periods.
+-- Used for composite charts (coarse for old + full precision for recent) WITHOUT ever deleting raw input.
+CREATE TABLE IF NOT EXISTS power_agg (
+    timestamp TEXT NOT NULL,
+    resolution_sec INTEGER NOT NULL,  -- e.g. 120=2min, 600=10min
+    pv_power REAL,
+    battery_power REAL,
+    grid_power REAL,
+    load_power REAL,
+    soc REAL,
+    grid_status INTEGER,
+    PRIMARY KEY (timestamp, resolution_sec)
+);
+CREATE INDEX IF NOT EXISTS idx_power_agg_ts_res ON power_agg(timestamp, resolution_sec);
+
 CREATE TABLE IF NOT EXISTS aggregation_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     run_timestamp TEXT NOT NULL,
@@ -547,6 +631,13 @@ async def init_db():
             await db.commit()
         except Exception:
             pass  # ignore if already exist or other
+        # Ensure power_agg exists for older composite data (idempotent)
+        try:
+            await db.execute("CREATE TABLE IF NOT EXISTS power_agg (timestamp TEXT NOT NULL, resolution_sec INTEGER NOT NULL, pv_power REAL, battery_power REAL, grid_power REAL, load_power REAL, soc REAL, grid_status INTEGER, PRIMARY KEY (timestamp, resolution_sec))")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_power_agg_ts_res ON power_agg(timestamp, resolution_sec)")
+            await db.commit()
+        except Exception:
+            pass
     logger.info(f"Database ready: {DB_FILE}")
 
 
@@ -652,6 +743,37 @@ def compute_energy_kwh(rows: List[Dict], power_key: str) -> float:
     return round(total, 3)
 
 
+def _downsample_rows(rows: List[Dict], bucket_seconds: int) -> List[Dict]:
+    """Downsample power readings into time buckets (for long period charts using coarser resolution for older data)."""
+    if not rows:
+        return []
+    from collections import defaultdict
+    buckets = defaultdict(list)
+    for r in rows:
+        try:
+            ts = _parse_stored_ts(r["timestamp"])
+            key = int(ts.timestamp() // bucket_seconds) * bucket_seconds
+            buckets[key].append(r)
+        except Exception:
+            continue
+    result = []
+    for key in sorted(buckets.keys()):
+        group = buckets[key]
+        if not group:
+            continue
+        avg = {"timestamp": group[0]["timestamp"]}  # representative ts for bucket
+        for k in ["pv_power", "battery_power", "grid_power", "load_power", "soc"]:
+            vals = [g.get(k) for g in group if g.get(k) is not None]
+            avg[k] = sum(vals) / len(vals) if vals else None
+        # status last
+        for g in reversed(group):
+            if g.get("grid_status") is not None:
+                avg["grid_status"] = g.get("grid_status")
+                break
+        result.append(avg)
+    return result
+
+
 def get_current_prices_pln():
     cfg = load_config()
     return cfg.get("buy_price_grosze", 75) / 100.0, cfg.get("sell_price_grosze", 35) / 100.0
@@ -689,12 +811,14 @@ async def get_daily_energy_range(start: datetime, end: datetime) -> Dict[str, An
 
 
 async def get_summary(start: datetime, end: datetime) -> Dict[str, Any]:
-    # Use pre-aggregated daily for long periods to avoid slow full table scans
+    # Use pre-aggregated daily for long periods (fast path when available and non-zero).
+    # IMPORTANT: if daily is 0/empty (e.g. after partial historical processing), fall back to raw
+    # trapezoidal compute so week/month/year summaries are NEVER empty. Raw kept for 90d+.
     days = (end - start).days
     if days > 2:
         try:
             daily = await get_daily_energy_range(start, end)
-            if daily:
+            if daily and (daily.get("pv", 0) > 0.001 or daily.get("load", 0) > 0.001):
                 return daily
         except Exception:
             pass
@@ -938,6 +1062,55 @@ async def refresh_period_energy_chart():
         pass  # guard against DB issues or UI teardown
 
 
+async def charts_auto_tick():
+    """Root-level auto refresh tick for Charts page. Created at startup so its parent slot is never deleted on nav.
+    Uses on_charts guard + enabled/interval checks. Strong try to survive stale UI.
+    """
+    global last_chart_refresh_time, current_range, auto_status, on_charts
+    if not on_charts:
+        return
+    now = time.monotonic()
+    if charts_auto_refresh_enabled and (now - last_chart_refresh_time >= chart_refresh_interval):
+        last_chart_refresh_time = now
+        try:
+            await load_and_render(current_range.get("hours", 1), from_auto=True)
+            if auto_status and charts_auto_refresh_enabled:
+                auto_status.set_text(f"Auto-refreshing every {chart_refresh_interval}s • updated {get_local_now().strftime('%H:%M:%S')}")
+        except Exception:
+            pass  # protect against deleted slots / nav during render
+
+
+def _run_deferred_inits():
+    """Root-level checker for page init actions (replaces once timers created inside pages).
+    This timer is created at startup so its parent slot is never deleted.
+    Flags are set in show_* after building UI.
+    """
+    global _charts_defer_pending, _smoothing_defer_pending, _summary_defer_pending, _pending_summary_load
+    if _charts_defer_pending:
+        _charts_defer_pending = False
+        if on_charts:
+            try:
+                asyncio.create_task(refresh_period_energy_chart())
+            except Exception:
+                pass
+    if _smoothing_defer_pending:
+        _smoothing_defer_pending = False
+        if on_charts:
+            try:
+                update_smoothing_buttons(smoothing)
+            except Exception:
+                pass
+    if _summary_defer_pending:
+        _summary_defer_pending = False
+        load_fn = _pending_summary_load
+        if load_fn:
+            try:
+                asyncio.create_task(load_fn())
+            except Exception:
+                pass
+            _pending_summary_load = None
+
+
 # =============================================================================
 # BACKGROUND POLLER
 # =============================================================================
@@ -979,11 +1152,12 @@ async def start_poller():
                     latest_reading = reading
                     await insert_reading(reading)
                     logger.debug(f"Polled: SOC={reading.soc} PV={reading.pv_power} Bat={reading.battery_power} Grid={reading.grid_power}")
-                    # Best-effort immediate UI refresh for live dashboard
-                    try:
-                        ui.timer(0, update_live_dashboard, once=True)
-                    except Exception:
-                        pass  # safe if not on dashboard or no context
+                    # Best-effort immediate UI refresh for live dashboard (avoid creating timers from background poller - causes slot errors)
+                    if on_dashboard:
+                        try:
+                            update_live_dashboard()
+                        except Exception:
+                            pass  # safe if elements stale
                 else:
                     logger.warning("Poll returned no data (connection issue?)")
                     # Ensure we clean up the client on every failure path.
@@ -1022,133 +1196,60 @@ async def stop_poller():
 
 
 async def aggregate_old_data() -> int:
-    """Aggregate measurements older than 1 day into 30s buckets to save space.
-    Always records the run into aggregation_runs table.
+    """Update pre-aggregated data (daily + power_agg for composite charts) from raw.
+    CRITICAL: NEVER deletes, downsamples or overwrites any raw measurements data.
+    We ADD aggregated tables only so summaries are fast and long charts use coarse for old + full recent.
+    Always records the run. Obeys: add aggs, do not nuke/cut the input data.
     """
-    import time as _time  # local to avoid shadowing
+    import time as _time
     start_ts = datetime.now(timezone.utc)
     start_perf = _time.perf_counter()
-    cutoff = (start_ts - timedelta(days=1)).isoformat()
     rows_processed = 0
-    buckets_created = 0
+    aggs_touched = 0
     status = 'success'
     error_message = None
-
-    # Incremental: only process data since the last successful aggregation's cutoff.
-    # This prevents re-scanning all historical 30s buckets every run.
-    effective_start = (start_ts - timedelta(days=2)).isoformat()
-    try:
-        async with aiosqlite.connect(DB_FILE) as db:
-            cur = await db.execute(
-                "SELECT cutoff_time FROM aggregation_runs WHERE status='success' ORDER BY run_timestamp DESC LIMIT 1"
-            )
-            row = await cur.fetchone()
-            if row and row[0]:
-                effective_start = row[0]
-    except Exception:
-        pass
+    cutoff = (start_ts - timedelta(days=1)).isoformat()  # informational only now
 
     try:
         async with aiosqlite.connect(DB_FILE) as db:
-            cur = await db.execute(
-                """SELECT timestamp, soc, pv_power, battery_power, grid_power, load_power, grid_status,
-                          battery_max_charge_power, battery_max_discharge_power
-                   FROM measurements WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp""",
-                (effective_start, cutoff)
-            )
-            rows = await cur.fetchall()
-            rows_processed = len(rows) if rows else 0
+            # Full daily backfill (correct trapezoid). Cheap and guarantees week/month/year have numbers.
+            try:
+                await _update_daily_aggregates(db, None)
+            except Exception as daily_err:
+                logger.warning(f"Daily update failed: {daily_err}")
 
-            if not rows:
-                # no rows, but will still record the run below
+            # Build/store power aggs for older slices (for composite long charts).
+            # Does not touch raw.
+            try:
+                touched = await _update_power_aggregates(db, start_ts)
+                aggs_touched = touched
+            except Exception as pa_err:
+                logger.warning(f"Power agg update failed: {pa_err}")
+
+            await db.commit()
+
+            # For logging, count current power aggs as proxy
+            try:
+                cur = await db.execute("SELECT COUNT(*) FROM power_agg")
+                aggs_touched = (await cur.fetchone() or (0,))[0]
+            except Exception:
                 pass
-            else:
-                from collections import defaultdict
-                buckets = defaultdict(list)
-                for row in rows:
-                    ts = row[0]
-                    try:
-                        dt = _parse_stored_ts(ts)
-                    except Exception:
-                        continue
-                    # floor to 30s
-                    secs = (dt.second // 30) * 30
-                    bucket_dt = dt.replace(second=secs, microsecond=0)
-                    key = bucket_dt.isoformat()
-                    buckets[key].append(row[1:])
 
-                inserts = []
-                for key, group in buckets.items():
-                    if not group:
-                        continue
-                    n = len(group)
-                    def avg(idx):
-                        vals = [g[idx] for g in group if g[idx] is not None]
-                        return sum(vals) / len(vals) if vals else None
-                    soc = avg(0)
-                    pv = avg(1)
-                    bat = avg(2)
-                    grid = avg(3)
-                    load = avg(4)
-                    # status: last non-null
-                    status_val = None
-                    for g in reversed(group):
-                        if g[5] is not None:
-                            status_val = g[5]
-                            break
-                    max_ch = avg(6)
-                    max_dis = avg(7)
-                    inserts.append((key, soc, pv, bat, grid, load, status_val, max_ch, max_dis))
-
-                if inserts:
-                    await db.execute("DELETE FROM measurements WHERE timestamp < ?", (cutoff,))
-                    await db.executemany(
-                        """INSERT INTO measurements (timestamp, soc, pv_power, battery_power, grid_power, load_power,
-                                                      grid_status, battery_max_charge_power, battery_max_discharge_power)
-                           VALUES (?,?,?,?,?,?,?,?,?)""",
-                        inserts
-                    )
-                    await db.commit()
-                    buckets_created = len(inserts)
-                    logger.info(f"Aggregated {rows_processed} rows >1d old into {buckets_created} 30s buckets")
-
-                    # Maintain daily pre-aggregates (used to accelerate long period summaries)
-                    try:
-                        await _update_daily_aggregates(db, start_ts - timedelta(days=3))
-                    except Exception as daily_err:
-                        logger.warning(f"Daily aggregate update failed: {daily_err}")
-
-                    # Reclaim disk space. DELETE only marks pages free; VACUUM actually shrinks the .db file.
-                    try:
-                        await db.execute("VACUUM")
-                        logger.info("Database VACUUM completed after aggregation")
-                    except Exception as vac_err:
-                        logger.warning(f"VACUUM failed after aggregation: {vac_err}")
-
-                    # Prune old aggregation run history (keep last 90 days) + vacuum again if we deleted anything
-                    try:
-                        prune_cutoff = (start_ts - timedelta(days=90)).isoformat()
-                        cur = await db.execute("DELETE FROM aggregation_runs WHERE run_timestamp < ?", (prune_cutoff,))
-                        pruned = cur.rowcount
-                        if pruned and pruned > 0:
-                            await db.execute("VACUUM")
-                            logger.info(f"Pruned {pruned} old aggregation run records + re-VACUUM")
-                    except Exception as prune_err:
-                        logger.warning(f"Failed to prune old aggregation runs: {prune_err}")
+            rows_processed = 1  # marker that run touched aggs
+            logger.info(f"Maintenance: daily + power aggs updated (raw preserved, no deletes)")
 
     except Exception as e:
         status = 'error'
         error_message = str(e)
         logger.error(f"Aggregation run error: {e}")
 
-    # Always record the run
     duration = _time.perf_counter() - start_perf
     try:
         await _log_aggregation_run(
             run_timestamp=start_ts.isoformat(),
             duration_seconds=round(duration, 3),
             rows_processed=rows_processed,
-            buckets_created=buckets_created,
+            buckets_created=aggs_touched,  # repurposed to # power_agg rows after update
             status=status,
             error_message=error_message,
             cutoff_time=cutoff
@@ -1191,39 +1292,252 @@ async def _log_aggregation_run(
         await db.commit()
 
 
-async def _update_daily_aggregates(db: aiosqlite.Connection, since: datetime) -> None:
-    """Populate energy_daily using recent 30s (or raw) data. This pre-agg speeds up long summaries."""
+async def _update_daily_aggregates(db: aiosqlite.Connection, since: datetime = None) -> None:
+    """Populate energy_daily using data with proper trapezoidal integration (never the broken *30/3600 approx).
+    since=None means full backfill over all available raw (ensures week/month/year summaries are populated).
+    Raw measurements input is NEVER cut or modified.
+    """
     try:
-        cutoff_str = since.isoformat()
-        # Approximate daily energy from 30s avg power samples (30s = 1/120 hour)
+        where = ""
+        params = ()
+        if since is not None:
+            cutoff_str = since.isoformat()
+            where = "WHERE timestamp >= ?"
+            params = (cutoff_str,)
         cur = await db.execute(
-            """SELECT date(timestamp) as d,
-                      COALESCE(SUM(pv_power),0) * 30.0 / 3600 as pv_e,
-                      COALESCE(SUM(CASE WHEN battery_power < 0 THEN -battery_power ELSE 0 END),0) * 30.0 / 3600 as bat_d_e,
-                      COALESCE(SUM(CASE WHEN grid_power > 0 THEN grid_power ELSE 0 END),0) * 30.0 / 3600 as g_i_e,
-                      COALESCE(SUM(CASE WHEN grid_power < 0 THEN -grid_power ELSE 0 END),0) * 30.0 / 3600 as g_e_e,
-                      COALESCE(SUM(load_power),0) * 30.0 / 3600 as load_e
-               FROM measurements
-               WHERE timestamp >= ?
-               GROUP BY d""",
-            (cutoff_str,)
+            f"SELECT timestamp, pv_power, battery_power, grid_power, load_power FROM measurements {where} ORDER BY timestamp",
+            params
         )
-        for d, pv_e, bat_d_e, g_i_e, g_e_e, load_e in await cur.fetchall():
-            if d:
-                await db.execute(
-                    """INSERT INTO energy_daily (date, pv_energy_kwh, battery_discharge_kwh, grid_import_kwh, grid_export_kwh, load_energy_kwh)
-                       VALUES (?,?,?,?,?,?)
-                       ON CONFLICT(date) DO UPDATE SET
-                         pv_energy_kwh=excluded.pv_energy_kwh,
-                         battery_discharge_kwh=excluded.battery_discharge_kwh,
-                         grid_import_kwh=excluded.grid_import_kwh,
-                         grid_export_kwh=excluded.grid_export_kwh,
-                         load_energy_kwh=excluded.load_energy_kwh""",
-                    (d, round(pv_e or 0, 4), round(bat_d_e or 0, 4), round(g_i_e or 0, 4), round(g_e_e or 0, 4), round(load_e or 0, 4))
-                )
+        rows = await cur.fetchall()
+        if not rows:
+            return
+        from collections import defaultdict
+        by_day = defaultdict(list)
+        for r in rows:
+            try:
+                ts = r[0]
+                dt = _parse_stored_ts(ts)
+                day = dt.date().isoformat()
+                by_day[day].append({
+                    "timestamp": ts,
+                    "pv_power": r[1],
+                    "battery_power": r[2],
+                    "grid_power": r[3],
+                    "load_power": r[4],
+                })
+            except Exception:
+                continue
+
+        for d, day_rows in by_day.items():
+            if len(day_rows) < 2:
+                # still record 0s if we want presence, but skip for now
+                continue
+            pv = compute_energy_kwh(day_rows, "pv_power")
+            load = compute_energy_kwh(day_rows, "load_power")
+
+            # signed flows (copy logic from get_summary for accuracy)
+            bat_discharge = 0.0
+            bat_charge = 0.0
+            grid_import = 0.0
+            grid_export = 0.0
+            for i in range(1, len(day_rows)):
+                t0 = _parse_stored_ts(day_rows[i-1]["timestamp"])
+                t1 = _parse_stored_ts(day_rows[i]["timestamp"])
+                dt_h = max(0.0, (t1 - t0).total_seconds() / 3600.0)
+                b0 = day_rows[i-1].get("battery_power") or 0.0
+                b1 = day_rows[i].get("battery_power") or 0.0
+                g0 = day_rows[i-1].get("grid_power") or 0.0
+                g1 = day_rows[i].get("grid_power") or 0.0
+                bat_discharge += max(0.0, -((b0 + b1) / 2.0)) * dt_h
+                bat_charge += max(0.0, ((b0 + b1) / 2.0)) * dt_h
+                grid_import += max(0.0, ((g0 + g1) / 2.0)) * dt_h
+                grid_export += max(0.0, -((g0 + g1) / 2.0)) * dt_h
+
+            await db.execute(
+                """INSERT INTO energy_daily (date, pv_energy_kwh, battery_discharge_kwh, grid_import_kwh, grid_export_kwh, load_energy_kwh)
+                   VALUES (?,?,?,?,?,?)
+                   ON CONFLICT(date) DO UPDATE SET
+                     pv_energy_kwh=excluded.pv_energy_kwh,
+                     battery_discharge_kwh=excluded.battery_discharge_kwh,
+                     grid_import_kwh=excluded.grid_import_kwh,
+                     grid_export_kwh=excluded.grid_export_kwh,
+                     load_energy_kwh=excluded.load_energy_kwh""",
+                (d, round(pv, 4), round(bat_discharge, 4), round(grid_import, 4), round(grid_export, 4), round(load, 4))
+            )
         await db.commit()
     except Exception as e:
         logger.warning(f"_update_daily_aggregates error: {e}")
+
+
+async def _update_power_aggregates(db: aiosqlite.Connection, start_ts: datetime) -> int:
+    """Populate power_agg with downsampled versions for older data only.
+    We keep ALL raw in measurements forever. power_agg is *additional* data source for composite long charts.
+    Resolutions: >14d -> 600s (10min), >7d -> 120s (2min).
+    Returns count of rows touched/inserted.
+    """
+    touched = 0
+    try:
+        now = start_ts
+        # For all data, but we will only store the coarse for the old parts; recent always comes from raw in queries.
+        # To support future long history, downsample and store old.
+        cur = await db.execute(
+            "SELECT timestamp, pv_power, battery_power, grid_power, load_power, soc, grid_status FROM measurements ORDER BY timestamp"
+        )
+        rows = await cur.fetchall()
+        if not rows:
+            return 0
+        # Compute cutoffs
+        cutoff_14 = (now - timedelta(days=14)).isoformat()
+        cutoff_7 = (now - timedelta(days=7)).isoformat()
+
+        # Group for 10min on very old, 2min on medium old
+        from collections import defaultdict
+        def make_agg(rows_in, res_sec):
+            if not rows_in:
+                return []
+            buckets = defaultdict(list)
+            for r in rows_in:
+                try:
+                    ts = _parse_stored_ts(r[0])
+                    key = int(ts.timestamp() // res_sec) * res_sec
+                    buckets[key].append(r)
+                except Exception:
+                    continue
+            out = []
+            for k in sorted(buckets):
+                g = buckets[k]
+                if not g: continue
+                def av(idx):
+                    vs = [x[idx] for x in g if x[idx] is not None]
+                    return sum(vs)/len(vs) if vs else None
+                out.append((
+                    g[0][0],  # rep ts (first in bucket)
+                    res_sec,
+                    av(1), av(2), av(3), av(4), av(5), g[-1][6] if g[-1][6] is not None else None
+                ))
+            return out
+
+        very_old = [r for r in rows if r[0] < cutoff_14]
+        medium_old = [r for r in rows if cutoff_14 <= r[0] < cutoff_7]
+
+        inserts = []
+        inserts.extend(make_agg(very_old, 600))
+        inserts.extend(make_agg(medium_old, 120))
+
+        if inserts:
+            await db.executemany(
+                """INSERT INTO power_agg (timestamp, resolution_sec, pv_power, battery_power, grid_power, load_power, soc, grid_status)
+                   VALUES (?,?,?,?,?,?,?,?)
+                   ON CONFLICT(timestamp, resolution_sec) DO UPDATE SET
+                     pv_power=excluded.pv_power, battery_power=excluded.battery_power,
+                     grid_power=excluded.grid_power, load_power=excluded.load_power,
+                     soc=excluded.soc, grid_status=excluded.grid_status""",
+                inserts
+            )
+            touched = len(inserts)
+            logger.info(f"power_agg updated: {touched} coarse rows for old periods (raw untouched)")
+    except Exception as e:
+        logger.warning(f"_update_power_aggregates error: {e}")
+    return touched
+
+
+async def get_composite_readings(hours: int) -> List[Dict[str, Any]]:
+    """Return stitched readings for charts: aggregated (coarse) data for older parts + full raw for recent.
+    Example for 30d (hours=720): 10min agg for first ~14d, 2min for ~7-14d, full raw last 7d.
+    This loads far fewer points for old while preserving accuracy for recent + all raw always kept.
+    """
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(hours=hours)
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            db.row_factory = aiosqlite.Row
+            # Always get recent full precision (last 7 days or all if shorter period)
+            recent_cutoff = (now - timedelta(days=7)).isoformat()
+            if hours <= 24 * 7:
+                # short period: all from raw
+                async with db.execute(
+                    "SELECT * FROM measurements WHERE timestamp >= ? ORDER BY timestamp ASC",
+                    (since.isoformat(),)
+                ) as cur:
+                    return [dict(r) for r in await cur.fetchall()]
+
+            # long: raw for last week
+            async with db.execute(
+                "SELECT * FROM measurements WHERE timestamp >= ? ORDER BY timestamp ASC",
+                (max(since.isoformat(), recent_cutoff),)
+            ) as cur:
+                recent_rows = [dict(r) for r in await cur.fetchall()]
+
+            # older parts from power_agg at proper res
+            old_rows = []
+            # determine needed res
+            if hours > 24 * 21:
+                # use 10min for oldest, 2min for middle
+                # first get 10min for the very old slice
+                agg_since = since.isoformat()
+                async with db.execute(
+                    "SELECT timestamp, pv_power, battery_power, grid_power, load_power, soc, grid_status FROM power_agg WHERE resolution_sec=600 AND timestamp >= ? AND timestamp < ? ORDER BY timestamp",
+                    (agg_since, recent_cutoff)
+                ) as cur:
+                    for r in await cur.fetchall():
+                        old_rows.append({
+                            "timestamp": r["timestamp"],
+                            "pv_power": r["pv_power"],
+                            "battery_power": r["battery_power"],
+                            "grid_power": r["grid_power"],
+                            "load_power": r["load_power"],
+                            "soc": r["soc"],
+                            "grid_status": r["grid_status"],
+                        })
+                # 2min for the next band if needed (between 14d and 7d, but clamp to since)
+                mid_start = (now - timedelta(days=14)).isoformat()
+                async with db.execute(
+                    "SELECT timestamp, pv_power, battery_power, grid_power, load_power, soc, grid_status FROM power_agg WHERE resolution_sec=120 AND timestamp >= ? AND timestamp < ? ORDER BY timestamp",
+                    (max(agg_since, mid_start), recent_cutoff)
+                ) as cur:
+                    for r in await cur.fetchall():
+                        old_rows.append({
+                            "timestamp": r["timestamp"],
+                            "pv_power": r["pv_power"],
+                            "battery_power": r["battery_power"],
+                            "grid_power": r["grid_power"],
+                            "load_power": r["load_power"],
+                            "soc": r["soc"],
+                            "grid_status": r["grid_status"],
+                        })
+            else:
+                # 7d < hours <=21d : use 2min for the old part
+                agg_since = since.isoformat()
+                async with db.execute(
+                    "SELECT timestamp, pv_power, battery_power, grid_power, load_power, soc, grid_status FROM power_agg WHERE resolution_sec=120 AND timestamp >= ? AND timestamp < ? ORDER BY timestamp",
+                    (agg_since, recent_cutoff)
+                ) as cur:
+                    for r in await cur.fetchall():
+                        old_rows.append({
+                            "timestamp": r["timestamp"],
+                            "pv_power": r["pv_power"],
+                            "battery_power": r["battery_power"],
+                            "grid_power": r["grid_power"],
+                            "load_power": r["load_power"],
+                            "soc": r["soc"],
+                            "grid_status": r["grid_status"],
+                        })
+
+            # merge + sort (prefer raw recent if overlap, but cutoffs avoid)
+            all_r = old_rows + recent_rows
+            # de-dup by ts (rare)
+            seen = set()
+            uniq = []
+            for r in sorted(all_r, key=lambda x: x.get("timestamp", "")):
+                k = r.get("timestamp")
+                if k not in seen:
+                    seen.add(k)
+                    uniq.append(r)
+            return uniq
+    except Exception as e:
+        logger.warning(f"get_composite_readings error, falling back to raw: {e}")
+        # safe fallback to raw
+        return await get_readings_since(since)
 
 
 async def maintenance_loop():
@@ -1585,7 +1899,12 @@ live_mix = None
 period_energy_chart1 = period_energy_chart2 = period_energy_chart3 = None
 recent_flow_values = deque(maxlen=3)  # last 3 (pv, battery, grid, load) for smoothing Energy Flow
 on_dashboard = False  # guard for live updates to avoid deleted element warnings
+on_charts = False
 _charts_auto_timer_started = False
+_charts_defer_pending = False
+_smoothing_defer_pending = False
+_summary_defer_pending = False
+_pending_summary_load = None
 chart_refresh_interval = 10  # seconds for charts auto-refresh (user configurable, >=2)
 last_chart_refresh_time = 0.0  # monotonic time of last auto chart refresh
 charts_auto_refresh_enabled = True
@@ -1606,12 +1925,14 @@ def build_sidebar():
     and closed/overlay on narrow mobile (starts value=False). Hamburger toggle works for mobile to open from closed. Desktop nav buttons are in-viewport without needing click.
     """
     global sidebar_drawer
+    # Start open so desktop shows it immediately; Quasar breakpoint + show-if-above will hide on narrow <1024.
+    # We only force-close via JS on actual mobile nav (never on desktop).
     sidebar_drawer = (
-        ui.left_drawer(top_corner=True, bottom_corner=True, value=False)
+        ui.left_drawer(top_corner=True, bottom_corner=True, value=True)
         .props('breakpoint=1024 show-if-above')
         .style('background-color: #111827; border-right: 1px solid #374151')
     )
-    sidebar_drawer.props('data-drawer-open="false"')  # initial closed for mobile proof
+    sidebar_drawer.props('data-drawer-open="true"')
     with sidebar_drawer:
         ui.label("SigenStor").classes("text-2xl font-bold q-pa-md text-white")
         ui.separator()
@@ -1626,29 +1947,27 @@ def build_sidebar():
         ]
 
         async def async_nav_handler(name: str):
-            if name == "dashboard":
-                show_dashboard()
-            elif name == "charts":
-                await show_charts()
-            elif name == "summary":
-                await show_summary()
-            elif name == "raw":
-                await show_raw_data()
-            elif name == "maintenance":
-                await show_maintenance()
-            elif name == "settings":
-                show_settings()
+            try:
+                if name == "dashboard":
+                    show_dashboard()
+                elif name == "charts":
+                    await show_charts()
+                elif name == "summary":
+                    await show_summary()
+                elif name == "raw":
+                    await show_raw_data()
+                elif name == "maintenance":
+                    await show_maintenance()
+                elif name == "settings":
+                    show_settings()
+            except Exception as nav_err:
+                # Guard against client deleted / stale element during rapid nav (NiceGUI known issue)
+                logger.debug(f"nav handler ignored error for {name}: {nav_err}")
 
-            # Close drawer after nav. On mobile this hides the overlay. On desktop the
-            # show-if-above breakpoint forces it visible again, so no visual "close".
-            global sidebar_drawer
-            if sidebar_drawer:
-                try:
-                    if getattr(sidebar_drawer, 'value', False):
-                        sidebar_drawer.value = False
-                        sidebar_drawer.props('data-drawer-open="false"')
-                except Exception:
-                    pass
+            # IMPORTANT: do NOT force-close here for desktop. The JS click handler below
+            # only closes when window.innerWidth < 1024 (mobile). Desktop keeps the
+            # persistent sidebar (show-if-above + breakpoint) open across nav changes.
+            # Removing the unconditional .value=False prevents "auto-close on change" in desktop browser.
 
         for label, func_name, icon in nav_items:
             btn = ui.button(label, icon=icon, on_click=lambda n=func_name: asyncio.create_task(async_nav_handler(n))).props("flat").classes(
@@ -1656,20 +1975,22 @@ def build_sidebar():
             ).style("color: #e5e7eb")
             btn.props(f'data-nav="{func_name}"')  # stable hook for tests (desktop + mobile)
 
-            # Only auto-close drawer on mobile viewports. Desktop keeps sidebar open.
+            # Only auto-close drawer on mobile viewports (<1024). Desktop (show-if-above) keeps sidebar persistently open.
+            # Do not touch drawer classes on wide screens.
             btn.on('click', lambda: ui.run_javascript("""
                 setTimeout(function() {
-                    if ((window.innerWidth || 9999) < 1024) {
-                        const drawer = document.querySelector('.q-drawer');
-                        if (drawer) {
-                            drawer.classList.remove('q-drawer--open');
-                            drawer.setAttribute('data-drawer-open', 'false');
-                            drawer.style.visibility = 'hidden';
-                            setTimeout(function() {
-                                if (drawer) drawer.style.visibility = '';
-                            }, 400);
-                        }
+                    const w = (window.innerWidth || 9999);
+                    const drawer = document.querySelector('.q-drawer');
+                    if (drawer && w < 1024) {
+                        // mobile only: close after nav click
+                        drawer.classList.remove('q-drawer--open');
+                        drawer.setAttribute('data-drawer-open', 'false');
+                        drawer.style.visibility = 'hidden';
+                        setTimeout(function() {
+                            if (drawer) drawer.style.visibility = '';
+                        }, 400);
                     }
+                    // desktop >=1024: do nothing; Quasar breakpoint/show-if-above keeps it visible
                 }, 80);
             """))
 
@@ -1810,8 +2131,9 @@ def update_live_dashboard():
 
 def show_dashboard():
     """Main real-time dashboard."""
-    global main_content, live_last_update, live_sankey, period_energy_chart1, period_energy_chart2, period_energy_chart3, on_dashboard
+    global main_content, live_last_update, live_sankey, period_energy_chart1, period_energy_chart2, period_energy_chart3, on_dashboard, on_charts
     on_dashboard = True
+    on_charts = False
     if main_content is None:
         main_content = ui.column().classes("w-full")
     main_content.clear()
@@ -1879,8 +2201,9 @@ def show_dashboard():
                     ui.label("Year").classes("text-xs text-center text-gray-400")
                     period_energy_chart3 = ui.plotly(create_period_energy_chart([], title="Year")).classes("w-full")
 
-            # initial load of period bars (once) - uses top-level refresher
-            ui.timer(0.05, lambda: asyncio.create_task(refresh_period_energy_chart()), once=True)
+            # initial load of period bars (once) - uses root defer to avoid slot deletion
+            global _charts_defer_pending
+            _charts_defer_pending = True
 
             # Quick note
             ui.label("Data is polled in background and saved to SQLite. Charts update automatically.").classes("text-xs text-gray-500 mt-2")
@@ -1891,9 +2214,10 @@ def show_dashboard():
 
 
 async def show_charts():
-    global main_content, current_range, smoothing, power_visible, auto_status, charts_auto_refresh_enabled, chart_refresh_interval, on_dashboard
+    global main_content, current_range, smoothing, power_visible, auto_status, charts_auto_refresh_enabled, chart_refresh_interval, on_dashboard, on_charts
     global period_energy_chart1, period_energy_chart2, period_energy_chart3
     on_dashboard = False
+    on_charts = True
     period_energy_chart1 = period_energy_chart2 = period_energy_chart3 = None
     if main_content is None:
         main_content = ui.column().classes("w-full")
@@ -1942,8 +2266,9 @@ async def show_charts():
             async def load_and_render(hours: int, from_auto: bool = False):
                 global current_range, smoothing, power_visible, auto_status
                 try:
-                    since = datetime.now(timezone.utc) - timedelta(hours=hours)
-                    rows = await get_readings_since(since)
+                    # Use composite: aggregated data from power_agg for older parts + full raw for recent.
+                    # This implements the requested behavior without ever cutting raw input data.
+                    rows = await get_composite_readings(hours)
 
                     if smoothing > 1:
                         rows = _smooth_rows(rows, smoothing)
@@ -2192,27 +2517,17 @@ async def show_charts():
             # Force clean single-active state right after creation (before initial load_and_render)
             update_smoothing_buttons(smoothing)
             # Re-apply after first paint to survive any NiceGUI render timing (guarantees 1 active on initial 03 shot)
-            ui.timer(0.05, lambda: update_smoothing_buttons(smoothing), once=True)
+            # use root defer
+            global _smoothing_defer_pending
+            _smoothing_defer_pending = True
 
             # chart_container created here so plots appear below the top controls+status
             chart_container = ui.column().classes("w-full gap-6")
 
-            # Auto refresh timer (base tick every 2s so we support down to 2s refresh)
-            # Created only once
+            # Auto-refresh is driven by a root-level timer (created at startup) guarded by on_charts flag.
+            # This prevents "parent slot deleted" when navigating away from Charts (timer no longer lives in a clearable container).
             global _charts_auto_timer_started
             if not _charts_auto_timer_started:
-                async def charts_auto_tick():
-                    global last_chart_refresh_time, current_range, auto_status
-                    now = time.monotonic()
-                    if charts_auto_refresh_enabled and (now - last_chart_refresh_time >= chart_refresh_interval):
-                        last_chart_refresh_time = now
-                        try:
-                            await load_and_render(current_range["hours"], from_auto=True)
-                            if auto_status and charts_auto_refresh_enabled:
-                                auto_status.set_text(f"Auto-refreshing every {chart_refresh_interval}s • updated {get_local_now().strftime('%H:%M:%S')}")
-                        except Exception:
-                            pass  # protect against deleted slots on nav
-                ui.timer(2, charts_auto_tick)  # check base every 2s
                 _charts_auto_timer_started = True
                 last_chart_refresh_time = time.monotonic()
 
@@ -2227,9 +2542,10 @@ async def show_charts():
 
 
 async def show_summary():
-    global main_content, on_dashboard
+    global main_content, on_dashboard, on_charts
     global period_energy_chart1, period_energy_chart2, period_energy_chart3
     on_dashboard = False
+    on_charts = False
     period_energy_chart1 = period_energy_chart2 = period_energy_chart3 = None
     if main_content is None:
         main_content = ui.column().classes("w-full")
@@ -2264,7 +2580,9 @@ async def show_summary():
                 # Use host OS TZ for boundaries (consistent with dashboard periods and all time displays)
                 now_loc = get_local_now()
                 today_start_loc = get_local_today_start()
-                summaries = []
+
+                # Build boundaries
+                bounds = []
                 for name, days in periods:
                     if days == 0:
                         start = to_utc(today_start_loc)
@@ -2278,65 +2596,84 @@ async def show_summary():
                     else:
                         start = to_utc(now_loc - timedelta(days=days))
                         end = to_utc(now_loc)
+                    bounds.append((name, start, end))
 
-                    summary = await get_summary(start, end)
-                    summaries.append((name, summary))
+                # Parallel fetch to make summaries load faster (was sequential awaits)
+                coros = [get_summary(s, e) for _, s, e in bounds]
+                results = await asyncio.gather(*coros, return_exceptions=True)
+                summaries = []
+                for (name, _, _), res in zip(bounds, results):
+                    if isinstance(res, Exception):
+                        res = {"pv": 0, "battery_discharge": 0, "battery_charge": 0, "grid_import": 0, "grid_export": 0, "load": 0, "self_sufficiency_pct": 0, "data_start": None}
+                    summaries.append((name, res))
 
                 buy_pln, sell_pln = get_current_prices_pln()
-                summary_container.clear()
-                with summary_container:
-                    for name, summary in summaries:
-                        with ui.card().classes("w-full p-4 bg-[#1f2937]"):
-                            display_name = name
-                            ds = summary.get("data_start")
-                            if ds:
-                                try:
-                                    ds_loc = ds.astimezone(get_local_tz()) if getattr(ds, 'tzinfo', None) else ds
-                                    display_name = f"{name} (since {ds_loc.strftime('%Y-%m-%d')})"
-                                except Exception:
-                                    display_name = f"{name} (since {ds.strftime('%Y-%m-%d')})"
-                            ui.label(display_name).classes("text-lg font-semibold mb-2 text-cyan-400")
-                            def add_hint(text: str):
-                                q = ui.html('<div style="margin-left:1px;width:13px;height:13px;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;border-radius:9999px;background:#000;border:1px solid #d1d5db;color:#d1d5db;cursor:help;">?</div>')
-                                q.tooltip(text)
-                                return q
+                try:
+                    summary_container.clear()
+                except Exception:
+                    pass
+                try:
+                    with summary_container:
+                        for name, summary in summaries:
+                            with ui.card().classes("w-full p-4 bg-[#1f2937]"):
+                                display_name = name
+                                ds = summary.get("data_start")
+                                if ds:
+                                    try:
+                                        ds_loc = ds.astimezone(get_local_tz()) if getattr(ds, 'tzinfo', None) else ds
+                                        display_name = f"{name} (since {ds_loc.strftime('%Y-%m-%d')})"
+                                    except Exception:
+                                        display_name = f"{name} (since {ds.strftime('%Y-%m-%d')})"
+                                ui.label(display_name).classes("text-lg font-semibold mb-2 text-cyan-400")
+                                def add_hint(text: str):
+                                    q = ui.html('<div style="margin-left:1px;width:13px;height:13px;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;border-radius:9999px;background:#000;border:1px solid #d1d5db;color:#d1d5db;cursor:help;">?</div>')
+                                    q.tooltip(text)
+                                    return q
 
-                            with ui.row().classes("gap-5 flex-wrap text-sm items-center"):
-                                with ui.row().classes("items-center gap-0.5"):
-                                    ui.label(f"☀️ PV: {summary['pv']:.2f} kWh")
-                                    add_hint("Total solar energy produced (kWh) — trapezoidal integration of PV power over the period.")
-                                with ui.row().classes("items-center gap-0.5"):
-                                    ui.label(f"🔋 Bat used: {summary['battery_discharge']:.2f} kWh")
-                                    add_hint("Total energy discharged from battery (kWh) — only negative battery power integrated.")
-                                with ui.row().classes("items-center gap-0.5"):
-                                    ui.label(f"🔋 Bat charged: {summary['battery_charge']:.2f} kWh")
-                                    add_hint("Total energy charged into battery (kWh) — only positive battery power integrated.")
-                                with ui.row().classes("items-center gap-0.5"):
-                                    ui.label(f"⬇️ Grid in: {summary['grid_import']:.2f} kWh")
-                                    add_hint("Total energy imported from the grid (kWh).")
-                                with ui.row().classes("items-center gap-0.5"):
-                                    ui.label(f"⬆️ Grid out: {summary['grid_export']:.2f} kWh")
-                                    add_hint("Total energy exported to the grid (kWh).")
-                                with ui.row().classes("items-center gap-0.5"):
-                                    ui.label(f"🏠 Load: {summary['load']:.2f} kWh")
-                                    add_hint("Total household consumption (kWh) — trapezoidal integration of load power.")
-                                with ui.row().classes("items-center gap-0.5"):
-                                    ui.label(f"♻️ Self: {summary['self_sufficiency_pct']:.2f}%")
-                                    add_hint("Self-sufficiency: % of consumption covered by own generation (PV + battery) instead of grid. Formula: (PV + battery - Grid import + Grid export) / Load × 100.")
-                            cost = round(summary['grid_import'] * buy_pln, 2)
-                            revenue = round(summary['grid_export'] * sell_pln, 2)
-                            net = round(cost - revenue, 2)
-                            with ui.row().classes("items-center text-xs text-gray-400 mt-1"):
-                                ui.label(f"💰 Est. cost {cost:.2f} PLN • revenue {revenue:.2f} PLN • net {net:+.2f} PLN")
-                                add_hint("Cost = Grid import × buy price. Revenue = Grid export × sell price. Net = revenue − cost.")
+                                with ui.row().classes("gap-5 flex-wrap text-sm items-center"):
+                                    with ui.row().classes("items-center gap-0.5"):
+                                        ui.label(f"☀️ PV: {summary['pv']:.2f} kWh")
+                                        add_hint("Total solar energy produced (kWh) — trapezoidal integration of PV power over the period.")
+                                    with ui.row().classes("items-center gap-0.5"):
+                                        ui.label(f"🔋 Bat used: {summary['battery_discharge']:.2f} kWh")
+                                        add_hint("Total energy discharged from battery (kWh) — only negative battery power integrated.")
+                                    with ui.row().classes("items-center gap-0.5"):
+                                        ui.label(f"🔋 Bat charged: {summary['battery_charge']:.2f} kWh")
+                                        add_hint("Total energy charged into battery (kWh) — only positive battery power integrated.")
+                                    with ui.row().classes("items-center gap-0.5"):
+                                        ui.label(f"⬇️ Grid in: {summary['grid_import']:.2f} kWh")
+                                        add_hint("Total energy imported from the grid (kWh).")
+                                    with ui.row().classes("items-center gap-0.5"):
+                                        ui.label(f"⬆️ Grid out: {summary['grid_export']:.2f} kWh")
+                                        add_hint("Total energy exported to the grid (kWh).")
+                                    with ui.row().classes("items-center gap-0.5"):
+                                        ui.label(f"🏠 Load: {summary['load']:.2f} kWh")
+                                        add_hint("Total household consumption (kWh) — trapezoidal integration of load power.")
+                                    with ui.row().classes("items-center gap-0.5"):
+                                        ui.label(f"♻️ Self: {summary['self_sufficiency_pct']:.2f}%")
+                                        add_hint("Self-sufficiency: % of consumption covered by own generation (PV + battery) instead of grid. Formula: (PV + battery - Grid import + Grid export) / Load × 100.")
+                                cost = round(summary['grid_import'] * buy_pln, 2)
+                                revenue = round(summary['grid_export'] * sell_pln, 2)
+                                net = round(cost - revenue, 2)
+                                with ui.row().classes("items-center text-xs text-gray-400 mt-1"):
+                                    ui.label(f"💰 Est. cost {cost:.2f} PLN • revenue {revenue:.2f} PLN • net {net:+.2f} PLN")
+                                    add_hint("Cost = Grid import × buy price. Revenue = Grid export × sell price. Net = revenue − cost.")
+                except Exception as render_err:
+                    # Guard against client deleted during nav (pre-existing NiceGUI issue with drawer + async loads)
+                    logger.debug(f"summary content render skipped (client stale): {render_err}")
 
-            await load_all()
+            # Defer the load to allow NiceGUI context to settle (helps with client deleted during nav from drawer)
+            # use root defer
+            global _summary_defer_pending, _pending_summary_load
+            _summary_defer_pending = True
+            _pending_summary_load = load_all
 
 
 async def show_raw_data():
-    global main_content, on_dashboard
+    global main_content, on_dashboard, on_charts
     global period_energy_chart1, period_energy_chart2, period_energy_chart3
     on_dashboard = False
+    on_charts = False
     period_energy_chart1 = period_energy_chart2 = period_energy_chart3 = None
     if main_content is None:
         main_content = ui.column().classes("w-full")
@@ -2406,9 +2743,10 @@ async def show_raw_data():
 
 async def show_maintenance():
     """UI section for aggregation task history, status, and monitoring."""
-    global main_content, on_dashboard
+    global main_content, on_dashboard, on_charts
     global period_energy_chart1, period_energy_chart2, period_energy_chart3
     on_dashboard = False
+    on_charts = False
     period_energy_chart1 = period_energy_chart2 = period_energy_chart3 = None
     if main_content is None:
         main_content = ui.column().classes("w-full")
@@ -2417,10 +2755,25 @@ async def show_maintenance():
         with ui.column().classes("w-full p-4 gap-6"):
             ui.label("Maintenance & Aggregation History").classes("text-3xl font-bold")
 
-            # Status header
+            # Status header (top)
             status_container = ui.row().classes("gap-4 items-center flex-wrap")
+            # Buttons placed directly above the recent runs table (user requirement)
+            buttons_container = ui.row().classes("gap-2 mb-2")
             runs_container = ui.column().classes("w-full")
             chart_container = ui.column().classes("w-full")
+
+            async def force_run():
+                ui.notify("Forcing aggregation run (raw data preserved)...", type="info")
+                try:
+                    n = await aggregate_old_data()
+                    ui.notify(f"Aggregation completed. (raw input untouched)", type="positive")
+                    await load_maintenance_data()
+                except Exception as e:
+                    ui.notify(f"Force run failed: {e}", type="negative")
+
+            with buttons_container:
+                ui.button("Refresh", on_click=lambda: asyncio.create_task(load_maintenance_data()), icon="refresh").props("size=sm")
+                ui.button("Force Run Now", on_click=force_run, icon="play_arrow").props("size=sm outline")
 
             async def load_maintenance_data():
                 runs = await get_aggregation_runs(100)
@@ -2471,7 +2824,7 @@ async def show_maintenance():
                         {"name": "run_timestamp", "label": "Run Time", "field": "run_timestamp", "sortable": True},
                         {"name": "duration_seconds", "label": "Duration (s)", "field": "duration_seconds"},
                         {"name": "rows_processed", "label": "Rows Processed", "field": "rows_processed"},
-                        {"name": "buckets_created", "label": "30s Buckets", "field": "buckets_created"},
+                        {"name": "buckets_created", "label": "Agg rows (power_agg)", "field": "buckets_created"},
                         {"name": "status", "label": "Status", "field": "status"},
                         {"name": "error_message", "label": "Error", "field": "error_message"},
                     ]
@@ -2526,11 +2879,11 @@ async def show_maintenance():
                             mode="lines+markers", line=dict(color="#2196f3")
                         ))
                         fig.add_trace(go.Scatter(
-                            x=times, y=buckets_c, name="Buckets Created",
+                            x=times, y=buckets_c, name="Agg rows updated",
                             mode="lines+markers", line=dict(color="#4caf50")
                         ))
                         fig.update_layout(
-                            title="Aggregation Runs (rows & buckets)",
+                            title="Aggregation Runs (daily + power aggs)",
                             xaxis_title="Time",
                             yaxis_title="Count",
                             height=280,
@@ -2544,57 +2897,43 @@ async def show_maintenance():
                     except Exception as chart_err:
                         ui.label(f"Chart error: {chart_err}").classes("text-red-400")
 
-            # Controls
-            with ui.row().classes("gap-2 mt-2"):
-                ui.button("Refresh", on_click=lambda: asyncio.create_task(load_maintenance_data()), icon="refresh").props("size=sm")
-                async def force_run():
-                    ui.notify("Forcing aggregation run...", type="info")
-                    try:
-                        n = await aggregate_old_data()
-                        ui.notify(f"Aggregation completed. Processed {n} rows.", type="positive")
-                        await load_maintenance_data()
-                    except Exception as e:
-                        ui.notify(f"Force run failed: {e}", type="negative")
-                ui.button("Force Run Now", on_click=force_run, icon="play_arrow").props("size=sm outline")
-
             await load_maintenance_data()
 
 
 def show_settings():
-    global main_content, on_dashboard
+    global main_content, on_dashboard, on_charts
     global period_energy_chart1, period_energy_chart2, period_energy_chart3
     on_dashboard = False
+    on_charts = False
     period_energy_chart1 = period_energy_chart2 = period_energy_chart3 = None
     if main_content is None:
         main_content = ui.column().classes("w-full")
     main_content.clear()
     with main_content:
-        with ui.column().classes("w-full p-4 max-w-[900px] mx-auto"):
+        # Professional, compact settings form.
+        # Tight grid on desktop (no huge empty space, fields packed nicely side-by-side).
+        # On mobile wraps cleanly. Centered container.
+        with ui.column().classes("w-full p-4 max-w-[820px] mx-auto"):
             ui.label("Settings").classes("text-3xl font-bold mb-4")
 
             cfg = load_config()
 
-            # Side-by-side / floating layout for edit fields (wraps on narrow, groups related)
-            # Centered on desktop for better look, still good on mobile
-            with ui.row().classes("w-full gap-4 flex-wrap"):
-                with ui.column().classes("flex-1 min-w-[220px]"):
-                    ip = ui.input("SigenStor IP", value=cfg["ip"]).props("filled")
-                with ui.column().classes("flex-1 min-w-[110px]"):
-                    port = ui.number("Port", value=cfg["port"], min=1, max=65535).props("filled")
-                with ui.column().classes("flex-1 min-w-[110px]"):
-                    slave = ui.number("Slave ID", value=cfg["slave_id"], min=1, max=247).props("filled")
+            # Compact side-by-side grids on desktop; wrap on narrow. max-w on inputs to avoid spread.
+            with ui.grid(columns=3).classes("gap-3 w-full"):
+                ip = ui.input("SigenStor IP", value=cfg["ip"]).props("filled dense").classes("col-span-1").style("max-width: 240px")
+                port = ui.number("Port", value=cfg["port"], min=1, max=65535).props("filled dense").classes("col-span-1").style("max-width: 140px")
+                slave = ui.number("Slave ID", value=cfg["slave_id"], min=1, max=247).props("filled dense").classes("col-span-1").style("max-width: 140px")
 
-            with ui.row().classes("w-full gap-4 flex-wrap mt-2"):
-                with ui.column().classes("flex-1 min-w-[180px]"):
-                    interval = ui.number("Poll interval (s)", value=cfg["poll_interval"], min=2, max=300).props("filled")
-                with ui.column().classes("flex-1 min-w-[180px]"):
-                    bat_cap = ui.number("Battery capacity (kWh)", value=cfg.get("battery_capacity_kwh", 18.0), min=0, step=0.1).props("filled")
+            # Two col for other numeric settings
+            with ui.grid(columns=2).classes("gap-3 w-full mt-2"):
+                interval = ui.number("Poll interval (s)", value=cfg["poll_interval"], min=2, max=300).props("filled dense").style("max-width: 180px")
+                bat_cap = ui.number("Battery capacity (kWh)", value=cfg.get("battery_capacity_kwh", 18.0), min=0, step=0.1).props("filled dense").style("max-width: 180px")
 
-            with ui.row().classes("w-full gap-4 flex-wrap mt-2"):
-                with ui.column().classes("flex-1 min-w-[180px]"):
-                    buy_price = ui.number("Buy price (grosze/kWh)", value=cfg.get("buy_price_grosze", 75), min=0, step=1).props("filled")
-                with ui.column().classes("flex-1 min-w-[180px]"):
-                    sell_price = ui.number("Sell price (grosze/kWh)", value=cfg.get("sell_price_grosze", 35), min=0, step=1).props("filled")
+            with ui.grid(columns=2).classes("gap-3 w-full mt-2"):
+                buy_price = ui.number("Buy price (grosze/kWh)", value=cfg.get("buy_price_grosze", 75), min=0, step=1).props("filled dense").style("max-width: 180px")
+                sell_price = ui.number("Sell price (grosze/kWh)", value=cfg.get("sell_price_grosze", 35), min=0, step=1).props("filled dense").style("max-width: 180px")
+
+            ui.label("Tip: Prices in grosze (1 PLN = 100 grosze). Battery capacity is usable kWh.").classes("text-xs text-gray-400 mt-1")
 
             async def test_conn():
                 test_client = SigenModbusClient(ip.value, int(port.value), int(slave.value))
@@ -2728,6 +3067,16 @@ if __name__ in {"__main__", "__mp_main__"}:
     # children of main_content and get deleted on clear()).
     ui.timer(3.0, update_live_dashboard)
     ui.timer(0.6, update_live_dashboard, once=True)
+
+    # Charts auto-refresh timer created at root so it never has a deleted parent slot when user navigates.
+    # The callback itself checks on_charts flag (set only inside show_charts).
+    ui.timer(2, charts_auto_tick)
+    _charts_auto_timer_started = True  # mark so show_charts doesn't try to create again
+    last_chart_refresh_time = time.monotonic()
+
+    # Root level 0.1s checker for deferred page inits (period bars, smoothing highlight, summary load).
+    # Replaces the once=True timers that were created inside main_content (which get deleted on nav).
+    ui.timer(0.1, _run_deferred_inits)
 
     # Run the NiceGUI app
     # Port and DB are resolved from env at import time (defaults keep prod behavior unchanged).
