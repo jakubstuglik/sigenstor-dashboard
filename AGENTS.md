@@ -6,9 +6,9 @@
 ## Mandatory Testing of All Changes (Playwright + Visual Inspection Loop)
 **Testing your changes with Playwright is MANDATORY for every modification.** Never skip this step. After editing code (especially UI, state, buttons, toggles, or handlers that affect the Charts page or config persistence):
 
-1. Start/restart the server in background or with monitor: `python main.py`.
+1. Start/restart the server in background or with monitor using dev isolation ONLY: `PORT=8081 SIGENSTOR_DB=data/sigenstor_dev.db python main.py` (venv python; NEVER 8080 or prod DB file).
 2. Use a Playwright script (python -c or temp_test_playwright.py or test_ui.py) to:
-   - Navigate to http://localhost:8080
+   - Navigate to http://localhost:8081 (or use hamburger on narrow viewport)
    - Click "CHARTS" in sidebar
    - Interact with the new controls: the Power series switches (toggles), AND the new smoothing buttons ("No smoothing", "3 last", "5 last").
    - Click period buttons too.
@@ -24,11 +24,11 @@
 ## Mandatory Testing Procedure for Every Change
 **You MUST test every code change yourself before considering it done:**
 
-1. Run the server: `python main.py` (use the monitor tool or background process to keep it alive).
-2. Use Playwright (via python -c script or test_ui.py) to:
-   - Open http://localhost:8080
-   - Navigate by clicking sidebar items (DASHBOARD, CHARTS, SUMMARY, RAW DATA, SETTINGS)
-   - Interact with controls: click range buttons, Apply, Refresh, form fields, etc.
+1. Run the server with dev isolation: `PORT=8081 SIGENSTOR_DB=data/sigenstor_dev.db python main.py` (use venv python; use monitor or background; NEVER 8080 or prod DB).
+2. Use Playwright (via python -c script or test_ui.py, with BASE_URL from PORT or 8081) to:
+   - Open http://localhost:8081
+   - Navigate by clicking sidebar items (DASHBOARD, CHARTS, SUMMARY, RAW DATA, SETTINGS) or hamburger on mobile.
+   - Interact with controls: click range buttons, Apply, Refresh, form fields, smoothing, etc.
    - Wait for async updates (timers, loads, plots).
 3. Save screenshots after key actions (e.g. `page.screenshot(path='screenshots/after_charts_click.png', full_page=True)`).
 4. Use the `read_file` tool on the .png files (it uses multimodal LLM to describe the visual content of the UI).
@@ -50,3 +50,4 @@
 - **Always visually inspect changes**: After every UI modification, use Playwright to capture screenshots of the affected components (e.g. gauges, charts, labels) and use `read_file` on the .png to describe the rendered result. Ensure no text clipping, sufficient spacing/gaps from edges/lines, readable font sizes (as specified: e.g. percent bigger than kWh), proper alignment, no overlaps, and that the UI looks functional and aesthetic (not cramped, titles fully visible, consistent styling). If it doesn't look good, iterate immediately. Add this as a mandatory step in testing.
 - Update this file with new lessons as they are discovered through testing.
 - **Visual QA is mandatory**: Never assume changes "look good" from code. Always capture screenshots of the exact UI component (gauges, labels, etc.) after edits, use `read_file` on the PNG to inspect for clipping (e.g. titles), font sizes (e.g. make percent larger than kWh), spacing, and overall aesthetics/legibility. Fix until it is functional and looks professional. Add explicit reminders here for future.
+- **Dev isolation for testing (per goal constraints)**: NEVER use port 8080 or the prod data/sigenstor.db when developing/testing. Always run `PORT=8081 SIGENSTOR_DB=data/sigenstor_dev.db python main.py` (using venv python). Seed dev DB from prod snapshot when needed. This keeps the running prod container untouched. Update this file if new gotchas with 8081 flows or separate DB are found. All playwright verification in this work used 8081+dev DB.

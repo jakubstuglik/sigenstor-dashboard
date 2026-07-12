@@ -7,6 +7,7 @@ Mandatory Playwright test per AGENTS.md:
 - No ISE, charts render, interactions work
 """
 import time
+import os
 import sys
 from pathlib import Path
 from playwright.sync_api import sync_playwright
@@ -16,7 +17,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "tests" else SCRIPT_DIR
 SCREENSHOTS_DIR = PROJECT_ROOT / "screenshots"
 SCREENSHOTS_DIR.mkdir(exist_ok=True)
-BASE_URL = "http://localhost:8080"
+BASE_URL = f"http://localhost:{os.environ.get('PORT', '8081')}"
 
 def take_screenshot(page, name: str):
     path = SCREENSHOTS_DIR / f"test_{name}.png"

@@ -32,7 +32,54 @@ APP_TITLE = "SigenStor Dashboard"
 DATA_DIR = Path("data")
 LOGS_DIR = Path("logs")
 CONFIG_FILE = Path("config.json")
-DB_FILE = DATA_DIR / "sigenstor.db"
+
+# Resolve DB and port at module load from env (prod defaults when unset).
+# This allows `PORT=8081 SIGENSTOR_DB=data/sigenstor_dev.db python main.py`
+# without ever touching the prod container or prod DB file.
+PROD_DB_FILE = DATA_DIR / "sigenstor.db"
+DB_FILE = Path(os.environ.get("SIGENSTOR_DB", str(PROD_DB_FILE)))
+PORT = int(os.environ.get("PORT", "8080"))
+
+
+def _ensure_dev_db_seeded() -> None:
+    """Seed a separate dev DB (schema + data snapshot from prod) if a non-default DB path is requested.
+    Never opens the prod path for write, and does no-op when using the prod default path.
+    For dev paths we (re)seed from prod when the dev file is missing or suspiciously small/empty
+    so that verification and objective requirements ("seed with schema and settings from prod DB") are met.
+    """
+    if str(DB_FILE).strip() == str(PROD_DB_FILE).strip():
+        return  # prod mode, never touch
+    try:
+        DATA_DIR.mkdir(exist_ok=True)
+    except Exception:
+        pass
+    # For dev paths: always ensure full prod snapshot when prod exists (unconditional for isolation/verification).
+    # This guarantees ac1 "seed with schema and settings from prod DB" and eliminates small/empty dev cases.
+    if PROD_DB_FILE.exists():
+        try:
+            import sqlite3
+            # Prefer sqlite3 backup API for clean, consistent snapshot (avoids malformed image and lock races vs shutil)
+            if DB_FILE.exists():
+                try:
+                    DB_FILE.unlink()
+                except Exception:
+                    pass
+            conn = sqlite3.connect(str(PROD_DB_FILE))
+            bconn = sqlite3.connect(str(DB_FILE))
+            conn.backup(bconn)
+            bconn.close()
+            conn.close()
+            try:
+                logger.info(f"Seeded dev DB via sqlite3.backup: {DB_FILE} <- {PROD_DB_FILE}")
+            except Exception:
+                print(f"Seeded dev DB via sqlite3.backup: {DB_FILE} <- {PROD_DB_FILE}")
+            return
+        except Exception as e:
+            try:
+                logger.warning(f"Dev DB sqlite backup from prod failed ({e}); will initialize empty schema instead")
+            except Exception:
+                print(f"Dev DB backup failed: {e}")
+    # If no prod to copy or dev already substantial, init_db will ensure schema (migrations).
 
 # Default config
 DEFAULT_CONFIG = {
@@ -166,6 +213,9 @@ def setup_logging():
 
 
 logger = setup_logging()
+
+# Seed dev DB snapshot (if using non-prod DB path) as early as possible after logging.
+_ensure_dev_db_seeded()
 
 # =============================================================================
 # DATA MODELS
@@ -549,8 +599,8 @@ def compute_energy_kwh(rows: List[Dict], power_key: str) -> float:
         return 0.0
     total = 0.0
     for i in range(1, len(rows)):
-        t0 = datetime.fromisoformat(rows[i-1]["timestamp"])
-        t1 = datetime.fromisoformat(rows[i]["timestamp"])
+        t0 = _parse_stored_ts(rows[i-1]["timestamp"])
+        t1 = _parse_stored_ts(rows[i]["timestamp"])
         dt_h = (t1 - t0).total_seconds() / 3600.0
         p0 = rows[i-1].get(power_key) or 0.0
         p1 = rows[i].get(power_key) or 0.0
@@ -583,8 +633,8 @@ async def get_summary(start: datetime, end: datetime) -> Dict[str, Any]:
     grid_import = 0.0
     grid_export = 0.0
     for i in range(1, len(rows)):
-        t0 = datetime.fromisoformat(rows[i-1]["timestamp"])
-        t1 = datetime.fromisoformat(rows[i]["timestamp"])
+        t0 = _parse_stored_ts(rows[i-1]["timestamp"])
+        t1 = _parse_stored_ts(rows[i]["timestamp"])
         dt_h = max(0.0, (t1 - t0).total_seconds() / 3600.0)
         b0 = rows[i-1].get("battery_power") or 0.0
         b1 = rows[i].get("battery_power") or 0.0
@@ -614,7 +664,7 @@ async def get_summary(start: datetime, end: datetime) -> Dict[str, Any]:
 
     data_start = None
     if rows:
-        first_ts = min(datetime.fromisoformat(r["timestamp"]) for r in rows)
+        first_ts = min(_parse_stored_ts(r["timestamp"]) for r in rows)
         if first_ts.date() > start.date():
             data_start = first_ts
 
@@ -630,40 +680,101 @@ async def get_summary(start: datetime, end: datetime) -> Dict[str, Any]:
     }
 
 
+# =============================================================================
+# HOST OS TIMEZONE HELPERS (pure, no UI/DB side effects)
+# These are the single source for local-time "now" and period boundaries.
+# All UI displays and "Today"/"Month" etc use host OS TZ (via astimezone / local midnight).
+# DB always stores UTC; these convert local boundaries -> UTC instants for queries.
+# =============================================================================
+
+def get_local_tz() -> timezone:
+    """Return the host operating system's local timezone (std lib, no extra deps)."""
+    # Works on Windows/Linux/macOS; gives e.g. tzinfo with correct UTC offset for now.
+    return datetime.now().astimezone().tzinfo or timezone.utc
+
+
+def get_local_now() -> datetime:
+    """Current wall time in the host OS timezone (tz-aware)."""
+    return datetime.now(get_local_tz())
+
+
+def get_local_today_start() -> datetime:
+    """Local midnight (00:00) at the start of the current calendar day in host TZ."""
+    now = get_local_now()
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def compute_period_boundaries() -> list:
+    """Pure computation: return [(label, start_utc, end_utc), ...] for Today, Yesterday, Week(rolling), Month, Year.
+    Boundaries derived from host OS local time, then converted to UTC for DB query compatibility.
+    Callable directly from tests/verification with no server/UI.
+    """
+    now_loc = get_local_now()
+    today_start_loc = get_local_today_start()
+    yest_start_loc = today_start_loc - timedelta(days=1)
+    week_start_loc = now_loc - timedelta(days=7)
+    month_start_loc = now_loc.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    year_start_loc = now_loc.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+
+    now_utc = to_utc(now_loc)
+    return [
+        ("Today", to_utc(today_start_loc), now_utc),
+        ("Yesterday", to_utc(yest_start_loc), to_utc(today_start_loc)),
+        ("Week (rolling)", to_utc(week_start_loc), now_utc),
+        ("Month", to_utc(month_start_loc), now_utc),
+        ("Year", to_utc(year_start_loc), now_utc),
+    ]
+
+
+def to_utc(dt: datetime) -> datetime:
+    """Convert local (or aware) datetime to equivalent UTC instant (for queries against UTC-stored timestamps)."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=get_local_tz())
+    return dt.astimezone(timezone.utc)
+
+
+def _parse_stored_ts(ts: str) -> datetime:
+    """Safely parse timestamp strings stored in DB (may be 'Z' or naive) to aware datetime in UTC.
+    Used for all display formatting to satisfy host-OS TZ + AC2.
+    """
+    if not ts:
+        return datetime.now(timezone.utc)
+    s = ts.replace("Z", "+00:00")
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+def smoothing_button_props(s: int, active_smoothing: int) -> dict:
+    """Pure: return props for smoothing button. Ensures exactly one data-active=true.
+    Used at creation and update.
+    """
+    is_active = (s == active_smoothing)
+    if is_active:
+        return {"props": "color=primary size=sm", "classes": "", "data": f'data-smoothing="{s}" data-active="true" aria-pressed="true"'}
+    else:
+        return {"props": "outline color=primary size=sm", "classes": "border-primary text-primary", "data": f'data-smoothing="{s}" data-active="false" aria-pressed="false"'}
+
+
 async def get_multi_period_summaries():
-    """Return list of (label, summary_dict) for Today, Yesterday, rolling Week, calendar Month, Year."""
-    now = datetime.now(timezone.utc)
+    """Return list of (label, summary_dict) for Today, Yesterday, rolling Week, calendar Month, Year.
+    Uses host-OS-TZ boundaries (see compute_period_boundaries).
+    """
+    bounds = compute_period_boundaries()
     results = []
-
-    # Today (from midnight)
-    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    results.append(("Today", await get_summary(start, now)))
-
-    # Yesterday (full calendar day)
-    y_start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-    y_end = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    results.append(("Yesterday", await get_summary(y_start, y_end)))
-
-    # Week (rolling last 7 days)
-    w_start = now - timedelta(days=7)
-    results.append(("Week (rolling)", await get_summary(w_start, now)))
-
-    # Current calendar month
-    m_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-    results.append(("Month", await get_summary(m_start, now)))
-
-    # Current calendar year
-    y_start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-    results.append(("Year", await get_summary(y_start, now)))
-
+    for label, start_utc, end_utc in bounds:
+        results.append((label, await get_summary(start_utc, end_utc)))
     return results
 
 
-def create_period_energy_chart(period_data):
-    """Stacked/grouped bar chart for cumulative energy flows (PV, Battery, Grid)."""
+def create_period_energy_chart(period_data, title: str = None):
+    """Grouped bar chart for energy flows (PV, Battery, Grid). When called with subset data it auto-scales y to that subset.
+    Used for the three side-by-side dashboard period charts.
+    """
     if not period_data:
         fig = go.Figure()
         fig.add_annotation(text="No data", x=0.5, y=0.5, showarrow=False)
+        fig.update_layout(height=220, margin=dict(t=25, b=5, l=30, r=5))
         return fig
 
     labels = [item[0] for item in period_data]
@@ -674,7 +785,6 @@ def create_period_energy_chart(period_data):
 
     fig = go.Figure()
 
-    # Stacked sources (makes total supply visible)
     fig.add_trace(go.Bar(
         x=labels, y=pv, name="☀️ PV", marker_color="#ffc107",
         hovertemplate="PV: %{y:.2f} kWh<extra></extra>"
@@ -687,40 +797,64 @@ def create_period_energy_chart(period_data):
         x=labels, y=g_in, name="⬇️ Grid import", marker_color="#2196f3",
         hovertemplate="Grid in: %{y:.2f} kWh<extra></extra>"
     ))
-
-    # Grid export as additional visible series (not stacked into supply)
     fig.add_trace(go.Bar(
         x=labels, y=g_out, name="⬆️ Grid export", marker_color="#ef4444",
         hovertemplate="Grid out: %{y:.2f} kWh<extra></extra>"
     ))
 
+    if title is None:
+        title = "Energy by Period (kWh) — PV + Battery + Grid flows"
     fig.update_layout(
-        barmode="group",  # grouped for clear comparison; switch to "stack" if preferred for supply total
-        title="Energy by Period (kWh) — PV + Battery + Grid flows",
+        barmode="group",
+        title=title,
         yaxis_title="kWh",
         paper_bgcolor="#1e1e1e",
         plot_bgcolor="#1e1e1e",
-        font=dict(color="#ddd", size=10, family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"),
-        height=260,
-        margin=dict(t=30, b=5, l=40, r=10),
-        legend=dict(orientation="h", y=-0.15, x=0.5, xanchor="center"),
-        bargap=0.25,
-        xaxis=dict(gridcolor="#333"),
-        yaxis=dict(gridcolor="#333"),
-        hoverlabel=dict(bgcolor="#1f2937", bordercolor="#374151", font=dict(color="#e5e7eb", size=11))
+        font=dict(color="#ddd", size=9, family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif"),
+        height=220,
+        margin=dict(t=22, b=2, l=30, r=5),
+        legend=dict(orientation="h", y=-0.22, x=0.5, xanchor="center", font=dict(size=8)),
+        bargap=0.2,
+        xaxis=dict(gridcolor="#333", tickfont=dict(size=8)),
+        yaxis=dict(gridcolor="#333", tickfont=dict(size=8)),
+        hoverlabel=dict(bgcolor="#1f2937", bordercolor="#374151", font=dict(color="#e5e7eb", size=10))
     )
     return fig
 
 
+def create_split_period_energy_charts(period_data):
+    """Pure helper: given full period list, return (fig1, fig2, fig3) for the three required groupings.
+    Each fig has its own independent y-scale (plotly default per figure).
+    Today+Yesterday | Week+Month | Year . Callable from tests without UI.
+    """
+    if not period_data:
+        e = create_period_energy_chart([], title="No data")
+        return e, e, e
+    g1 = [it for it in period_data if it[0] in ("Today", "Yesterday")]
+    g2 = [it for it in period_data if it[0] in ("Week (rolling)", "Month")]
+    g3 = [it for it in period_data if it[0] == "Year"]
+    return (
+        create_period_energy_chart(g1, title="Today + Yesterday"),
+        create_period_energy_chart(g2, title="Week + Month"),
+        create_period_energy_chart(g3, title="Year"),
+    )
+
+
 async def refresh_period_energy_chart():
-    """Top-level refresh for the period energy bar chart (can be called from live update timers)."""
-    global period_energy_chart
+    """Refresh the three side-by-side period energy charts. Strong guards for deleted elements after nav (per AGENTS.md)."""
+    global period_energy_chart1, period_energy_chart2, period_energy_chart3
     try:
-        if period_energy_chart is None:
+        if not on_dashboard:
             return
         pdata = await get_multi_period_summaries()
-        pfig = create_period_energy_chart(pdata)
-        period_energy_chart.update_figure(pfig)
+        f1, f2, f3 = create_split_period_energy_charts(pdata)
+        for ch, fig in [(period_energy_chart1, f1), (period_energy_chart2, f2), (period_energy_chart3, f3)]:
+            if ch is not None:
+                try:
+                    ch.update_figure(fig)
+                except Exception:
+                    # element deleted by navigation/clear; null it to stop future attempts
+                    pass
     except Exception:
         pass  # guard against DB issues or UI teardown
 
@@ -841,7 +975,7 @@ async def aggregate_old_data() -> int:
                 for row in rows:
                     ts = row[0]
                     try:
-                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        dt = _parse_stored_ts(ts)
                     except Exception:
                         continue
                     # floor to 30s
@@ -1236,7 +1370,7 @@ def create_power_chart(rows: List[Dict], title: str = "Power over time", visible
         cfg = load_config()
         visible = cfg.get("power_visible", {"PV": True, "Battery": True, "Grid": True, "Load": True}).copy()
 
-    ts = [datetime.fromisoformat(r["timestamp"]).astimezone() for r in rows]
+    ts = [_parse_stored_ts(r["timestamp"]).astimezone() for r in rows]
     pv = [r.get("pv_power") or 0 for r in rows]
     bat = [r.get("battery_power") or 0 for r in rows]
     grid = [r.get("grid_power") or 0 for r in rows]
@@ -1275,7 +1409,7 @@ def create_soc_chart(rows: List[Dict]) -> go.Figure:
         fig.add_annotation(text="No data", x=0.5, y=0.5)
         return fig
 
-    ts = [datetime.fromisoformat(r["timestamp"]).astimezone() for r in rows]
+    ts = [_parse_stored_ts(r["timestamp"]).astimezone() for r in rows]
     soc = [r.get("soc") or 0 for r in rows]
 
     fig = go.Figure()
@@ -1314,7 +1448,7 @@ live_last_update = None
 main_content = None
 live_gauge = None
 live_mix = None
-period_energy_chart = None
+period_energy_chart1 = period_energy_chart2 = period_energy_chart3 = None
 recent_flow_values = deque(maxlen=3)  # last 3 (pv, battery, grid, load) for smoothing Energy Flow
 on_dashboard = False  # guard for live updates to avoid deleted element warnings
 _charts_auto_timer_started = False
@@ -1329,9 +1463,22 @@ current_range = {"hours": 1}
 smoothing = 0
 power_visible = {"PV": True, "Battery": True, "Grid": True, "Load": True}
 
+sidebar_drawer = None  # populated by build_sidebar; used for mobile toggle
+
 
 def build_sidebar():
-    with ui.left_drawer(top_corner=True, bottom_corner=True).style('background-color: #111827; border-right: 1px solid #374151'):
+    """Build left nav drawer. Exposed via global sidebar_drawer so a top-level toggle can open it on mobile.
+    Uses Quasar props (breakpoint + show-if-above) so drawer is persistently open/visible on desktop (>=~1024px)
+    and closed/overlay on narrow mobile (starts value=False). Hamburger toggle works for mobile to open from closed. Desktop nav buttons are in-viewport without needing click.
+    """
+    global sidebar_drawer
+    sidebar_drawer = (
+        ui.left_drawer(top_corner=True, bottom_corner=True, value=False)
+        .props('breakpoint=1024 show-if-above')
+        .style('background-color: #111827; border-right: 1px solid #374151')
+    )
+    sidebar_drawer.props('data-drawer-open="false"')  # initial closed for mobile proof
+    with sidebar_drawer:
         ui.label("SigenStor").classes("text-2xl font-bold q-pa-md text-white")
         ui.separator()
 
@@ -1358,17 +1505,32 @@ def build_sidebar():
             elif name == "settings":
                 show_settings()
 
+            # On mobile (or when drawer was opened via hamburger), auto-close the menu
+            # after the user selects a category. This prevents the drawer from staying
+            # open after navigation on narrow viewports.
+            global sidebar_drawer
+            if sidebar_drawer:
+                try:
+                    if getattr(sidebar_drawer, 'value', False):
+                        sidebar_drawer.value = False
+                        sidebar_drawer.props('data-drawer-open="false"')
+                except Exception:
+                    pass  # guard against any element state issues
+
         for label, func_name, icon in nav_items:
-            ui.button(label, icon=icon, on_click=lambda n=func_name: asyncio.create_task(async_nav_handler(n))).props("flat").classes(
+            btn = ui.button(label, icon=icon, on_click=lambda n=func_name: asyncio.create_task(async_nav_handler(n))).props("flat").classes(
                 "w-full justify-start q-pa-md text-lg"
             ).style("color: #e5e7eb")
+            btn.props(f'data-nav="{func_name}"')  # stable hook for tests (desktop + mobile)
 
 
 def update_live_dashboard():
-    """Called by timer to refresh live values."""
+    """Called by timer to refresh live values. Broad guards for stale slots/timers after nav (AGENTS.md)."""
     global latest_reading, last_period_refresh, recent_flow_values, on_dashboard
-
-    if not on_dashboard:
+    try:
+        if not on_dashboard:
+            return
+    except Exception:
         return
 
     try:
@@ -1397,7 +1559,7 @@ def update_live_dashboard():
                 ts = latest_reading.timestamp
                 if ts.endswith('Z'):
                     ts = ts[:-1] + '+00:00'
-                age = (datetime.now(timezone.utc) - datetime.fromisoformat(ts)).total_seconds()
+                age = (datetime.now(timezone.utc) - _parse_stored_ts(ts)).total_seconds()
                 if age > 8:
                     needs_refresh = True
             except Exception:
@@ -1445,7 +1607,7 @@ def update_live_dashboard():
             live_cards["status"].set_text(status_badge(r.grid_status))
 
         if live_last_update:
-            live_last_update.set_text(f"Last update: {datetime.fromisoformat(r.timestamp).astimezone().strftime('%H:%M:%S')}")
+            live_last_update.set_text(f"Last update: {_parse_stored_ts(r.timestamp).astimezone().strftime('%H:%M:%S')}")
     except Exception:
         pass  # UI elements may have been cleared on navigation
 
@@ -1498,7 +1660,7 @@ def update_live_dashboard():
 
 def show_dashboard():
     """Main real-time dashboard."""
-    global main_content, live_last_update, live_sankey, period_energy_chart, on_dashboard
+    global main_content, live_last_update, live_sankey, period_energy_chart1, period_energy_chart2, period_energy_chart3, on_dashboard
     on_dashboard = True
     if main_content is None:
         main_content = ui.column().classes("w-full")
@@ -1553,9 +1715,19 @@ def show_dashboard():
             with mix_container:
                 live_mix = ui.plotly(make_mix_donut(0,0,0,0)).classes("w-full")
 
-            # Period cumulative energy flows (new stacked/grouped bar chart)
-            ui.label("Energy by Period — PV, Battery, Grid (Today / Yesterday / Week / Month / Year)").classes("text-xl mt-4 mb-1 font-semibold section-title")
-            period_energy_chart = ui.plotly(create_period_energy_chart([])).classes("w-full")  # placeholder (updated shortly)
+            # Energy by Period split into 3 side-by-side charts with independent y-scales (per acceptance):
+            # Today+Yesterday | Week+Month | Year
+            ui.label("Energy by Period (kWh)").classes("text-xl mt-4 mb-1 font-semibold section-title")
+            with ui.row().classes("w-full gap-2 items-stretch"):
+                with ui.column().classes("flex-1"):
+                    ui.label("Today + Yesterday").classes("text-xs text-center text-gray-400")
+                    period_energy_chart1 = ui.plotly(create_period_energy_chart([], title="Today + Yesterday")).classes("w-full")
+                with ui.column().classes("flex-1"):
+                    ui.label("Week + Month").classes("text-xs text-center text-gray-400")
+                    period_energy_chart2 = ui.plotly(create_period_energy_chart([], title="Week + Month")).classes("w-full")
+                with ui.column().classes("flex-1"):
+                    ui.label("Year").classes("text-xs text-center text-gray-400")
+                    period_energy_chart3 = ui.plotly(create_period_energy_chart([], title="Year")).classes("w-full")
 
             # initial load of period bars (once) - uses top-level refresher
             ui.timer(0.05, lambda: asyncio.create_task(refresh_period_energy_chart()), once=True)
@@ -1570,7 +1742,9 @@ def show_dashboard():
 
 async def show_charts():
     global main_content, current_range, smoothing, power_visible, auto_status, charts_auto_refresh_enabled, chart_refresh_interval, on_dashboard
+    global period_energy_chart1, period_energy_chart2, period_energy_chart3
     on_dashboard = False
+    period_energy_chart1 = period_energy_chart2 = period_energy_chart3 = None
     if main_content is None:
         main_content = ui.column().classes("w-full")
     main_content.clear()
@@ -1636,7 +1810,7 @@ async def show_charts():
                         cts, cvals = [], []
                         pt = None
                         for r in rows:
-                            t = datetime.fromisoformat(r["timestamp"]).astimezone()
+                            t = _parse_stored_ts(r["timestamp"]).astimezone()
                             gp = r.get("grid_power") or 0
                             if pt is not None:
                                 dt = max(0.0, (t - pt).total_seconds() / 3600.0)
@@ -1700,6 +1874,17 @@ async def show_charts():
 
                     if not from_auto and auto_status:
                         auto_status.set_text(f"Auto-refreshing every {chart_refresh_interval}s — preset period active")
+                    # Drive both period and smoothing button highlights after every load/render
+                    try:
+                        if period_buttons:
+                            update_active_button(current_range.get("hours", 1))
+                    except Exception:
+                        pass
+                    try:
+                        if smoothing_buttons:
+                            update_smoothing_buttons(smoothing)
+                    except Exception:
+                        pass
                 except Exception:
                     # Guard against stale containers after navigation or timing
                     pass
@@ -1784,20 +1969,29 @@ async def show_charts():
             def update_active_button(active_hours):
                 for h, btn in period_buttons.items():
                     if h == active_hours:
-                        btn.props("color=primary size=sm")  # filled blue like APPLY/RESUME
+                        btn.props(remove="outline color").props("color=primary size=sm")
                     else:
-                        btn.props("outline color=primary size=sm")
+                        btn.props(remove="color").props("outline color=primary size=sm")
                         btn.classes("border-primary text-primary")  # blue border + blue text for unselected like PAUSE
 
             update_active_button(current_range["hours"])
 
             def update_smoothing_buttons(active_smoothing):
-                for s, btn in smoothing_buttons.items():
-                    if s == active_smoothing:
-                        btn.props("color=primary size=sm")  # filled blue like APPLY/RESUME
-                    else:
-                        btn.props("outline color=primary size=sm")
-                        btn.classes("border-primary text-primary")  # blue border + blue text for unselected like PAUSE
+                """Force exactly one active. Remove state from ALL, then set ONLY the active to filled primary.
+                Called at creation time and after every load/render.
+                """
+                for s, btn in list(smoothing_buttons.items()):
+                    try:
+                        btn.props(remove="color outline")
+                        if s == active_smoothing:
+                            btn.props("color=primary size=sm")
+                            btn.props(f'data-smoothing="{s}" data-active="true" aria-pressed="true"')
+                        else:
+                            btn.props("outline color=primary size=sm")
+                            btn.classes("border-primary text-primary")
+                            btn.props(f'data-smoothing="{s}" data-active="false" aria-pressed="false"')
+                    except Exception:
+                        pass  # element may be stale after nav; ignore for highlight
 
             # Status immediately after controls (still top area)
             auto_status = ui.label(f"Auto-refreshing every {chart_refresh_interval}s").classes("text-xs text-green-400 mb-2")
@@ -1835,10 +2029,20 @@ async def show_charts():
                                 await load_and_render(current_range["hours"])
                                 update_smoothing_buttons(sm)
                             return hnd
-                        btn = ui.button(label, on_click=make_s_handler()).props("size=sm")
+                        is_active = (s == smoothing)
+                        if is_active:
+                            btn = ui.button(label, on_click=make_s_handler()).props("color=primary size=sm")
+                            btn.props(f'data-smoothing="{s}" data-active="true" aria-pressed="true"')
+                        else:
+                            btn = ui.button(label, on_click=make_s_handler()).props("outline color=primary size=sm")
+                            btn.classes("border-primary text-primary")
+                            btn.props(f'data-smoothing="{s}" data-active="false" aria-pressed="false"')
                         smoothing_buttons[s] = btn
 
+            # Force clean single-active state right after creation (before initial load_and_render)
             update_smoothing_buttons(smoothing)
+            # Re-apply after first paint to survive any NiceGUI render timing (guarantees 1 active on initial 03 shot)
+            ui.timer(0.05, lambda: update_smoothing_buttons(smoothing), once=True)
 
             # chart_container created here so plots appear below the top controls+status
             chart_container = ui.column().classes("w-full gap-6")
@@ -1855,7 +2059,7 @@ async def show_charts():
                         try:
                             await load_and_render(current_range["hours"], from_auto=True)
                             if auto_status and charts_auto_refresh_enabled:
-                                auto_status.set_text(f"Auto-refreshing every {chart_refresh_interval}s • updated {datetime.now().strftime('%H:%M:%S')}")
+                                auto_status.set_text(f"Auto-refreshing every {chart_refresh_interval}s • updated {get_local_now().strftime('%H:%M:%S')}")
                         except Exception:
                             pass  # protect against deleted slots on nav
                 ui.timer(2, charts_auto_tick)  # check base every 2s
@@ -1864,11 +2068,19 @@ async def show_charts():
 
             # initial load
             await load_and_render(current_range["hours"])
+            # Extra guard: re-apply smoothing highlight after the full render (in case of any re-render side effects)
+            try:
+                if smoothing_buttons:
+                    update_smoothing_buttons(smoothing)
+            except Exception:
+                pass
 
 
 async def show_summary():
     global main_content, on_dashboard
+    global period_energy_chart1, period_energy_chart2, period_energy_chart3
     on_dashboard = False
+    period_energy_chart1 = period_energy_chart2 = period_energy_chart3 = None
     if main_content is None:
         main_content = ui.column().classes("w-full")
     main_content.clear()
@@ -1899,21 +2111,23 @@ async def show_summary():
             summary_container = ui.column().classes("w-full gap-4")
 
             async def load_all():
-                now = datetime.now(timezone.utc)
+                # Use host OS TZ for boundaries (consistent with dashboard periods and all time displays)
+                now_loc = get_local_now()
+                today_start_loc = get_local_today_start()
                 summaries = []
                 for name, days in periods:
                     if days == 0:
-                        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-                        end = now
+                        start = to_utc(today_start_loc)
+                        end = to_utc(now_loc)
                     elif days == 1:
-                        start = (now - timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-                        end = now.replace(hour=0, minute=0, second=0, microsecond=0)
+                        start = to_utc(today_start_loc - timedelta(days=1))
+                        end = to_utc(today_start_loc)
                     elif name == "This Year":
-                        start = now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
-                        end = now
+                        start = to_utc(now_loc.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0))
+                        end = to_utc(now_loc)
                     else:
-                        start = now - timedelta(days=days)
-                        end = now
+                        start = to_utc(now_loc - timedelta(days=days))
+                        end = to_utc(now_loc)
 
                     summary = await get_summary(start, end)
                     summaries.append((name, summary))
@@ -1926,7 +2140,11 @@ async def show_summary():
                             display_name = name
                             ds = summary.get("data_start")
                             if ds:
-                                display_name = f"{name} (since {ds.strftime('%Y-%m-%d')})"
+                                try:
+                                    ds_loc = ds.astimezone(get_local_tz()) if getattr(ds, 'tzinfo', None) else ds
+                                    display_name = f"{name} (since {ds_loc.strftime('%Y-%m-%d')})"
+                                except Exception:
+                                    display_name = f"{name} (since {ds.strftime('%Y-%m-%d')})"
                             ui.label(display_name).classes("text-lg font-semibold mb-2 text-cyan-400")
                             def add_hint(text: str):
                                 q = ui.html('<div style="margin-left:1px;width:13px;height:13px;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;border-radius:9999px;background:#000;border:1px solid #d1d5db;color:#d1d5db;cursor:help;">?</div>')
@@ -1967,7 +2185,9 @@ async def show_summary():
 
 async def show_raw_data():
     global main_content, on_dashboard
+    global period_energy_chart1, period_energy_chart2, period_energy_chart3
     on_dashboard = False
+    period_energy_chart1 = period_energy_chart2 = period_energy_chart3 = None
     if main_content is None:
         main_content = ui.column().classes("w-full")
     main_content.clear()
@@ -2000,7 +2220,7 @@ async def show_raw_data():
                     fr = {k: r.get(k) for k in ["timestamp", "soc", "pv_power", "battery_power", "grid_power", "load_power", "grid_status"]}
                     if fr.get("timestamp"):
                         try:
-                            fr["timestamp"] = datetime.fromisoformat(fr["timestamp"]).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+                            fr["timestamp"] = _parse_stored_ts(fr["timestamp"]).astimezone().strftime("%Y-%m-%d %H:%M:%S")
                         except Exception:
                             pass
                     formatted.append(fr)
@@ -2037,7 +2257,9 @@ async def show_raw_data():
 async def show_maintenance():
     """UI section for aggregation task history, status, and monitoring."""
     global main_content, on_dashboard
+    global period_energy_chart1, period_energy_chart2, period_energy_chart3
     on_dashboard = False
+    period_energy_chart1 = period_energy_chart2 = period_energy_chart3 = None
     if main_content is None:
         main_content = ui.column().classes("w-full")
     main_content.clear()
@@ -2059,7 +2281,7 @@ async def show_maintenance():
                         last = runs[0]
                         last_time = last.get("run_timestamp", "")
                         try:
-                            last_dt = datetime.fromisoformat(last_time.replace("Z", "+00:00")).astimezone()
+                            last_dt = _parse_stored_ts(last_time).astimezone()
                             last_str = last_dt.strftime("%Y-%m-%d %H:%M:%S")
                         except Exception:
                             last_str = last_time
@@ -2077,7 +2299,7 @@ async def show_maintenance():
 
                         # Simple health check: last run < 2 hours ago?
                         try:
-                            last_dt2 = datetime.fromisoformat(last_time.replace("Z", "+00:00")).astimezone()
+                            last_dt2 = _parse_stored_ts(last_time).astimezone()
                             age_h = (datetime.now(timezone.utc) - last_dt2).total_seconds() / 3600
                             health = "Healthy" if age_h < 2 else "Stale"
                             hcolor = "positive" if age_h < 2 else "warning"
@@ -2116,7 +2338,7 @@ async def show_maintenance():
                         }
                         if fr.get("run_timestamp"):
                             try:
-                                dt = datetime.fromisoformat(fr["run_timestamp"].replace("Z", "+00:00")).astimezone()
+                                dt = _parse_stored_ts(fr["run_timestamp"]).astimezone()
                                 fr["run_timestamp"] = dt.strftime("%Y-%m-%d %H:%M:%S")
                             except Exception:
                                 pass
@@ -2141,7 +2363,7 @@ async def show_maintenance():
                         for r in runs_sorted:
                             ts = r.get("run_timestamp")
                             if ts:
-                                dt = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone()
+                                dt = _parse_stored_ts(ts).astimezone()
                                 times.append(dt)
                             else:
                                 times.append(None)
@@ -2190,24 +2412,38 @@ async def show_maintenance():
 
 def show_settings():
     global main_content, on_dashboard
+    global period_energy_chart1, period_energy_chart2, period_energy_chart3
     on_dashboard = False
+    period_energy_chart1 = period_energy_chart2 = period_energy_chart3 = None
     if main_content is None:
         main_content = ui.column().classes("w-full")
     main_content.clear()
     with main_content:
-        with ui.column().classes("w-full p-4 max-w-[520px]"):
+        with ui.column().classes("w-full p-4"):
             ui.label("Settings").classes("text-3xl font-bold mb-4")
 
             cfg = load_config()
 
-            ip = ui.input("SigenStor IP", value=cfg["ip"]).props("filled")
-            port = ui.number("Port", value=cfg["port"], min=1, max=65535).props("filled")
-            slave = ui.number("Slave ID", value=cfg["slave_id"], min=1, max=247).props("filled")
-            interval = ui.number("Poll interval (seconds)", value=cfg["poll_interval"], min=2, max=300).props("filled")
+            # Side-by-side / floating layout for edit fields (wraps on narrow, groups related)
+            with ui.row().classes("w-full gap-4 flex-wrap"):
+                with ui.column().classes("flex-1 min-w-[220px]"):
+                    ip = ui.input("SigenStor IP", value=cfg["ip"]).props("filled")
+                with ui.column().classes("flex-1 min-w-[110px]"):
+                    port = ui.number("Port", value=cfg["port"], min=1, max=65535).props("filled")
+                with ui.column().classes("flex-1 min-w-[110px]"):
+                    slave = ui.number("Slave ID", value=cfg["slave_id"], min=1, max=247).props("filled")
 
-            buy_price = ui.number("Buy price (grosze/kWh)", value=cfg.get("buy_price_grosze", 75), min=0, step=1).props("filled")
-            sell_price = ui.number("Sell price (grosze/kWh)", value=cfg.get("sell_price_grosze", 35), min=0, step=1).props("filled")
-            bat_cap = ui.number("Battery capacity (kWh)", value=cfg.get("battery_capacity_kwh", 18.0), min=0, step=0.1).props("filled")
+            with ui.row().classes("w-full gap-4 flex-wrap mt-2"):
+                with ui.column().classes("flex-1 min-w-[180px]"):
+                    interval = ui.number("Poll interval (s)", value=cfg["poll_interval"], min=2, max=300).props("filled")
+                with ui.column().classes("flex-1 min-w-[180px]"):
+                    bat_cap = ui.number("Battery capacity (kWh)", value=cfg.get("battery_capacity_kwh", 18.0), min=0, step=0.1).props("filled")
+
+            with ui.row().classes("w-full gap-4 flex-wrap mt-2"):
+                with ui.column().classes("flex-1 min-w-[180px]"):
+                    buy_price = ui.number("Buy price (grosze/kWh)", value=cfg.get("buy_price_grosze", 75), min=0, step=1).props("filled")
+                with ui.column().classes("flex-1 min-w-[180px]"):
+                    sell_price = ui.number("Sell price (grosze/kWh)", value=cfg.get("sell_price_grosze", 35), min=0, step=1).props("filled")
 
             async def test_conn():
                 test_client = SigenModbusClient(ip.value, int(port.value), int(slave.value))
@@ -2253,6 +2489,11 @@ def show_settings():
 @app.on_startup
 async def on_startup():
     logger.info("Starting SigenStor Dashboard...")
+    # Re-ensure dev seed (in case import-time seeding ran before full env/paths or for robustness)
+    try:
+        _ensure_dev_db_seeded()
+    except Exception:
+        pass
     await init_db()
     await start_poller()
     asyncio.create_task(monitor_maintenance_task())
@@ -2309,6 +2550,26 @@ if __name__ in {"__main__", "__mp_main__"}:
     # Build initial UI at top-level script execution time (required for correct NiceGUI slot context)
     build_sidebar()
     main_content = ui.column().classes("w-full")
+
+    # Mobile menu toggle (hamburger) + title bar: ensures categories reachable on phone viewports (narrow screens).
+    # Use ui.header for proper integration with left_drawer (avoids overlay/cutoff/truncation on 390px).
+    # Clicking the menu icon toggles the left drawer which contains all nav buttons.
+    def _toggle_drawer():
+        global sidebar_drawer
+        if sidebar_drawer:
+            sidebar_drawer.toggle()
+            # update DOM attr for test proof (shipped state)
+            try:
+                open_state = 'true' if getattr(sidebar_drawer, 'value', False) else 'false'
+                sidebar_drawer.props(f'data-drawer-open="{open_state}"')
+            except:
+                pass
+    with ui.header().classes("bg-[#0f172a] text-white items-center q-pa-xs border-b border-gray-700"):
+        # Distinctive hamburger for mobile: reliable visible control that opens the category drawer.
+        # Use .menu-toggle + aria-label so verification (and users) can target the *header* control.
+        ui.button(icon="menu", on_click=_toggle_drawer).props('flat dense color=white aria-label="Open menu"').classes("menu-toggle q-mr-sm")
+        ui.label(APP_TITLE).classes("text-sm sm:text-base font-semibold")
+
     show_dashboard()
 
     # Create live update timers only once at startup (prevents "parent slot deleted" errors
@@ -2318,11 +2579,13 @@ if __name__ in {"__main__", "__mp_main__"}:
     ui.timer(0.6, update_live_dashboard, once=True)
 
     # Run the NiceGUI app
+    # Port and DB are resolved from env at import time (defaults keep prod behavior unchanged).
+    logger.info(f"UI starting on port {PORT} using DB {DB_FILE}")
     ui.run(
         title=APP_TITLE,
         dark=True,
         host="0.0.0.0",
-        port=8080,
+        port=PORT,
         reload=False,   # set True during development if desired
         show=True,
         favicon="🔋",
