@@ -7,6 +7,7 @@ Python + NiceGUI + Plotly + SQLite + pymodbus (read-only)
 import asyncio
 import json
 import logging
+import logging.handlers
 import os
 import sqlite3
 import struct
@@ -197,19 +198,61 @@ RUNNING_STATE_MAP = {  # 30051 if added later
 # LOGGING
 # =============================================================================
 
+def _compress_log(source: Path, dest: Path) -> None:
+    """Compress a rotated log file using gzip."""
+    import gzip
+    import shutil
+    with open(source, 'rb') as f_in:
+        with gzip.open(dest, 'wb') as f_out:
+            shutil.copyfileobj(f_in, f_out)
+    source.unlink(missing_ok=True)
+
+def _cleanup_old_logs(days: int = 30) -> None:
+    """Delete log files older than N days (including .gz)."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    for f in LOGS_DIR.glob("sigenstor_*.log*"):
+        try:
+            # parse date from name like sigenstor_20260712.log or .log.1.gz
+            stem = f.stem.split('.')[0] if '.' in f.name else f.stem
+            if stem.startswith('sigenstor_'):
+                date_str = stem.split('_', 1)[1][:8]
+                if len(date_str) == 8:
+                    log_date = datetime.strptime(date_str, '%Y%m%d').replace(tzinfo=timezone.utc)
+                    if log_date < cutoff:
+                        f.unlink(missing_ok=True)
+        except Exception:
+            pass
+
 def setup_logging():
     LOGS_DIR.mkdir(exist_ok=True)
-    log_file = LOGS_DIR / f"sigenstor_{datetime.now().strftime('%Y%m%d')}.log"
+
+    # Use daily rotating file handler with compression and retention
+    log_file = LOGS_DIR / "sigenstor.log"
+
+    handler = logging.handlers.TimedRotatingFileHandler(
+        log_file, when='midnight', interval=1, backupCount=30, encoding='utf-8'
+    )
+    handler.namer = lambda name: str(Path(name).with_suffix(''))  # keep .log
+    handler.rotator = lambda source, dest: _compress_log(Path(source), Path(dest).with_suffix('.log.gz'))
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[
             logging.StreamHandler(),
-            logging.FileHandler(log_file, encoding="utf-8"),
+            handler,
         ],
     )
-    return logging.getLogger("sigenstor")
+
+    # Cleanup old on startup
+    try:
+        _cleanup_old_logs(30)
+    except Exception:
+        pass
+
+    logger = logging.getLogger("sigenstor")
+    logger.info("Logging initialized with daily rotation + gzip + 30-day retention")
+    return logger
 
 
 logger = setup_logging()
@@ -619,7 +662,43 @@ def get_battery_capacity_kwh() -> float:
     return float(cfg.get("battery_capacity_kwh", 10.0))
 
 
+async def get_daily_energy_range(start: datetime, end: datetime) -> Dict[str, Any]:
+    """Fast lookup from pre-aggregated daily table."""
+    async with aiosqlite.connect(DB_FILE) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """SELECT * FROM energy_daily WHERE date >= ? AND date <= ? ORDER BY date""",
+            (start.date().isoformat(), end.date().isoformat())
+        )
+        rows = await cur.fetchall()
+        pv = sum((r['pv_energy_kwh'] or 0) for r in rows)
+        bat_d = sum((r['battery_discharge_kwh'] or 0) for r in rows)
+        g_i = sum((r['grid_import_kwh'] or 0) for r in rows)
+        g_e = sum((r['grid_export_kwh'] or 0) for r in rows)
+        load = sum((r['load_energy_kwh'] or 0) for r in rows)
+        self_suff = 0.0
+        if load > 0.001:
+            self_energy = pv + bat_d - g_i + g_e
+            self_suff = round(max(0.0, min(100.0, self_energy / load * 100)), 2)
+        return {
+            "pv": round(pv, 3), "battery_discharge": round(bat_d, 3),
+            "battery_charge": 0, "grid_import": round(g_i, 3), "grid_export": round(g_e, 3),
+            "load": round(load, 3), "self_sufficiency_pct": self_suff,
+            "data_start": None, "used_daily": True
+        }
+
+
 async def get_summary(start: datetime, end: datetime) -> Dict[str, Any]:
+    # Use pre-aggregated daily for long periods to avoid slow full table scans
+    days = (end - start).days
+    if days > 2:
+        try:
+            daily = await get_daily_energy_range(start, end)
+            if daily:
+                return daily
+        except Exception:
+            pass
+
     rows = await get_readings_range(start, end)
     if not rows:
         return {"pv": 0, "battery_discharge": 0, "battery_charge": 0, "grid_import": 0, "grid_export": 0, "load": 0, "self_sufficiency_pct": 0, "data_start": None}
@@ -955,13 +1034,27 @@ async def aggregate_old_data() -> int:
     status = 'success'
     error_message = None
 
+    # Incremental: only process data since the last successful aggregation's cutoff.
+    # This prevents re-scanning all historical 30s buckets every run.
+    effective_start = (start_ts - timedelta(days=2)).isoformat()
+    try:
+        async with aiosqlite.connect(DB_FILE) as db:
+            cur = await db.execute(
+                "SELECT cutoff_time FROM aggregation_runs WHERE status='success' ORDER BY run_timestamp DESC LIMIT 1"
+            )
+            row = await cur.fetchone()
+            if row and row[0]:
+                effective_start = row[0]
+    except Exception:
+        pass
+
     try:
         async with aiosqlite.connect(DB_FILE) as db:
             cur = await db.execute(
                 """SELECT timestamp, soc, pv_power, battery_power, grid_power, load_power, grid_status,
                           battery_max_charge_power, battery_max_discharge_power
-                   FROM measurements WHERE timestamp < ? ORDER BY timestamp""",
-                (cutoff,)
+                   FROM measurements WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp""",
+                (effective_start, cutoff)
             )
             rows = await cur.fetchall()
             rows_processed = len(rows) if rows else 0
@@ -1018,6 +1111,12 @@ async def aggregate_old_data() -> int:
                     await db.commit()
                     buckets_created = len(inserts)
                     logger.info(f"Aggregated {rows_processed} rows >1d old into {buckets_created} 30s buckets")
+
+                    # Maintain daily pre-aggregates (used to accelerate long period summaries)
+                    try:
+                        await _update_daily_aggregates(db, start_ts - timedelta(days=3))
+                    except Exception as daily_err:
+                        logger.warning(f"Daily aggregate update failed: {daily_err}")
 
                     # Reclaim disk space. DELETE only marks pages free; VACUUM actually shrinks the .db file.
                     try:
@@ -1090,6 +1189,41 @@ async def _log_aggregation_run(
             (run_timestamp, duration_seconds, rows_processed, buckets_created, status, error_message, cutoff_time)
         )
         await db.commit()
+
+
+async def _update_daily_aggregates(db: aiosqlite.Connection, since: datetime) -> None:
+    """Populate energy_daily using recent 30s (or raw) data. This pre-agg speeds up long summaries."""
+    try:
+        cutoff_str = since.isoformat()
+        # Approximate daily energy from 30s avg power samples (30s = 1/120 hour)
+        cur = await db.execute(
+            """SELECT date(timestamp) as d,
+                      COALESCE(SUM(pv_power),0) * 30.0 / 3600 as pv_e,
+                      COALESCE(SUM(CASE WHEN battery_power < 0 THEN -battery_power ELSE 0 END),0) * 30.0 / 3600 as bat_d_e,
+                      COALESCE(SUM(CASE WHEN grid_power > 0 THEN grid_power ELSE 0 END),0) * 30.0 / 3600 as g_i_e,
+                      COALESCE(SUM(CASE WHEN grid_power < 0 THEN -grid_power ELSE 0 END),0) * 30.0 / 3600 as g_e_e,
+                      COALESCE(SUM(load_power),0) * 30.0 / 3600 as load_e
+               FROM measurements
+               WHERE timestamp >= ?
+               GROUP BY d""",
+            (cutoff_str,)
+        )
+        for d, pv_e, bat_d_e, g_i_e, g_e_e, load_e in await cur.fetchall():
+            if d:
+                await db.execute(
+                    """INSERT INTO energy_daily (date, pv_energy_kwh, battery_discharge_kwh, grid_import_kwh, grid_export_kwh, load_energy_kwh)
+                       VALUES (?,?,?,?,?,?)
+                       ON CONFLICT(date) DO UPDATE SET
+                         pv_energy_kwh=excluded.pv_energy_kwh,
+                         battery_discharge_kwh=excluded.battery_discharge_kwh,
+                         grid_import_kwh=excluded.grid_import_kwh,
+                         grid_export_kwh=excluded.grid_export_kwh,
+                         load_energy_kwh=excluded.load_energy_kwh""",
+                    (d, round(pv_e or 0, 4), round(bat_d_e or 0, 4), round(g_i_e or 0, 4), round(g_e_e or 0, 4), round(load_e or 0, 4))
+                )
+        await db.commit()
+    except Exception as e:
+        logger.warning(f"_update_daily_aggregates error: {e}")
 
 
 async def maintenance_loop():
@@ -1505,9 +1639,8 @@ def build_sidebar():
             elif name == "settings":
                 show_settings()
 
-            # On mobile (or when drawer was opened via hamburger), auto-close the menu
-            # after the user selects a category. This prevents the drawer from staying
-            # open after navigation on narrow viewports.
+            # Close drawer after nav. On mobile this hides the overlay. On desktop the
+            # show-if-above breakpoint forces it visible again, so no visual "close".
             global sidebar_drawer
             if sidebar_drawer:
                 try:
@@ -1515,13 +1648,30 @@ def build_sidebar():
                         sidebar_drawer.value = False
                         sidebar_drawer.props('data-drawer-open="false"')
                 except Exception:
-                    pass  # guard against any element state issues
+                    pass
 
         for label, func_name, icon in nav_items:
             btn = ui.button(label, icon=icon, on_click=lambda n=func_name: asyncio.create_task(async_nav_handler(n))).props("flat").classes(
                 "w-full justify-start q-pa-md text-lg"
             ).style("color: #e5e7eb")
             btn.props(f'data-nav="{func_name}"')  # stable hook for tests (desktop + mobile)
+
+            # Only auto-close drawer on mobile viewports. Desktop keeps sidebar open.
+            btn.on('click', lambda: ui.run_javascript("""
+                setTimeout(function() {
+                    if ((window.innerWidth || 9999) < 1024) {
+                        const drawer = document.querySelector('.q-drawer');
+                        if (drawer) {
+                            drawer.classList.remove('q-drawer--open');
+                            drawer.setAttribute('data-drawer-open', 'false');
+                            drawer.style.visibility = 'hidden';
+                            setTimeout(function() {
+                                if (drawer) drawer.style.visibility = '';
+                            }, 400);
+                        }
+                    }
+                }, 80);
+            """))
 
 
 def update_live_dashboard():
@@ -2419,12 +2569,13 @@ def show_settings():
         main_content = ui.column().classes("w-full")
     main_content.clear()
     with main_content:
-        with ui.column().classes("w-full p-4"):
+        with ui.column().classes("w-full p-4 max-w-[900px] mx-auto"):
             ui.label("Settings").classes("text-3xl font-bold mb-4")
 
             cfg = load_config()
 
             # Side-by-side / floating layout for edit fields (wraps on narrow, groups related)
+            # Centered on desktop for better look, still good on mobile
             with ui.row().classes("w-full gap-4 flex-wrap"):
                 with ui.column().classes("flex-1 min-w-[220px]"):
                     ip = ui.input("SigenStor IP", value=cfg["ip"]).props("filled")
